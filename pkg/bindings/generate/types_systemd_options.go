@@ -4,7 +4,7 @@ package generate
 import (
 	"net/url"
 
-	"github.com/containers/podman/v4/pkg/bindings/internal/util"
+	"github.com/containers/podman/v5/pkg/bindings/internal/util"
 )
 
 // Changed returns true if named field has been set
@@ -225,4 +225,19 @@ func (o *SystemdOptions) GetRequires() []string {
 		return z
 	}
 	return *o.Requires
+}
+
+// WithAdditionalEnvVariables set field AdditionalEnvVariables to given value
+func (o *SystemdOptions) WithAdditionalEnvVariables(value []string) *SystemdOptions {
+	o.AdditionalEnvVariables = &value
+	return o
+}
+
+// GetAdditionalEnvVariables returns value of field AdditionalEnvVariables
+func (o *SystemdOptions) GetAdditionalEnvVariables() []string {
+	if o.AdditionalEnvVariables == nil {
+		var z []string
+		return z
+	}
+	return *o.AdditionalEnvVariables
 }

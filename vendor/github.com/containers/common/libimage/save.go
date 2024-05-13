@@ -1,7 +1,11 @@
+//go:build !remote
+
 package libimage
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -13,7 +17,6 @@ import (
 	ociTransport "github.com/containers/image/v5/oci/layout"
 	"github.com/containers/image/v5/types"
 	ociv1 "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -47,10 +50,10 @@ func (r *Runtime) Save(ctx context.Context, names []string, format, path string,
 		// All formats support saving 1.
 	default:
 		if format != "docker-archive" {
-			return errors.Errorf("unsupported format %q for saving multiple images (only docker-archive)", format)
+			return fmt.Errorf("unsupported format %q for saving multiple images (only docker-archive)", format)
 		}
 		if len(options.AdditionalTags) > 0 {
-			return errors.Errorf("cannot save multiple images with multiple tags")
+			return errors.New("cannot save multiple images with multiple tags")
 		}
 	}
 
@@ -58,7 +61,7 @@ func (r *Runtime) Save(ctx context.Context, names []string, format, path string,
 	switch format {
 	case "oci-archive", "oci-dir", "docker-dir":
 		if len(names) > 1 {
-			return errors.Errorf("%q does not support saving multiple images (%v)", format, names)
+			return fmt.Errorf("%q does not support saving multiple images (%v)", format, names)
 		}
 		return r.saveSingleImage(ctx, names[0], format, path, options)
 
@@ -67,7 +70,7 @@ func (r *Runtime) Save(ctx context.Context, names []string, format, path string,
 		return r.saveDockerArchive(ctx, names, path, options)
 	}
 
-	return errors.Errorf("unsupported format %q for saving images", format)
+	return fmt.Errorf("unsupported format %q for saving images", format)
 }
 
 // saveSingleImage saves the specified image name to the specified path.
@@ -109,7 +112,7 @@ func (r *Runtime) saveSingleImage(ctx context.Context, name, format, path string
 		options.ManifestMIMEType = manifest.DockerV2Schema2MediaType
 
 	default:
-		return errors.Errorf("unsupported format %q for saving images", format)
+		return fmt.Errorf("unsupported format %q for saving images", format)
 	}
 
 	if err != nil {
@@ -143,7 +146,7 @@ func (r *Runtime) saveDockerArchive(ctx context.Context, names []string, path st
 		if err == nil {
 			tagged, withTag := named.(reference.NamedTagged)
 			if !withTag {
-				return errors.Errorf("invalid additional tag %q: normalized to untagged %q", tag, named.String())
+				return fmt.Errorf("invalid additional tag %q: normalized to untagged %q", tag, named.String())
 			}
 			additionalTags = append(additionalTags, tagged)
 		}
@@ -195,7 +198,7 @@ func (r *Runtime) saveDockerArchive(ctx context.Context, names []string, path st
 	for _, id := range orderedIDs {
 		local, exists := localImages[id]
 		if !exists {
-			return errors.Errorf("internal error: saveDockerArchive: ID %s not found in local map", id)
+			return fmt.Errorf("internal error: saveDockerArchive: ID %s not found in local map", id)
 		}
 
 		copyOpts := options.CopyOptions

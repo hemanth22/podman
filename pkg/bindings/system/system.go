@@ -3,22 +3,22 @@ package system
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/bindings"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/domain/entities/types"
 	"github.com/sirupsen/logrus"
 )
 
 // Events allows you to monitor libdpod related events like container creation and
 // removal.  The events are then passed to the eventChan provided. The optional cancelChan
 // can be used to cancel the read of events and close down the HTTP connection.
-func Events(ctx context.Context, eventChan chan entities.Event, cancelChan chan bool, options *EventsOptions) error {
+func Events(ctx context.Context, eventChan chan types.Event, cancelChan chan bool, options *EventsOptions) error {
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
 		return err
@@ -36,14 +36,15 @@ func Events(ctx context.Context, eventChan chan entities.Event, cancelChan chan 
 	if cancelChan != nil {
 		go func() {
 			<-cancelChan
-			err = response.Body.Close()
-			logrus.Error(errors.Wrap(err, "unable to close event response body"))
+			if err := response.Body.Close(); err != nil {
+				logrus.Errorf("Unable to close event response body: %v", err)
+			}
 		}()
 	}
 
 	dec := json.NewDecoder(response.Body)
 	for err = (error)(nil); err == nil; {
-		var e = entities.Event{}
+		var e = types.Event{}
 		err = dec.Decode(&e)
 		if err == nil {
 			eventChan <- e
@@ -56,14 +57,14 @@ func Events(ctx context.Context, eventChan chan entities.Event, cancelChan chan 
 	case errors.Is(err, io.EOF):
 		return nil
 	default:
-		return errors.Wrap(err, "unable to decode event response")
+		return fmt.Errorf("unable to decode event response: %w", err)
 	}
 }
 
 // Prune removes all unused system data.
-func Prune(ctx context.Context, options *PruneOptions) (*entities.SystemPruneReport, error) {
+func Prune(ctx context.Context, options *PruneOptions) (*types.SystemPruneReport, error) {
 	var (
-		report entities.SystemPruneReport
+		report types.SystemPruneReport
 	)
 	conn, err := bindings.GetClient(ctx)
 	if err != nil {
@@ -82,10 +83,10 @@ func Prune(ctx context.Context, options *PruneOptions) (*entities.SystemPruneRep
 	return &report, response.Process(&report)
 }
 
-func Version(ctx context.Context, options *VersionOptions) (*entities.SystemVersionReport, error) {
+func Version(ctx context.Context, options *VersionOptions) (*types.SystemVersionReport, error) {
 	var (
-		component entities.ComponentVersion
-		report    entities.SystemVersionReport
+		component types.SystemComponentVersion
+		report    types.SystemVersionReport
 	)
 	if options == nil {
 		options = new(VersionOptions)
@@ -133,8 +134,8 @@ func Version(ctx context.Context, options *VersionOptions) (*entities.SystemVers
 
 // DiskUsage returns information about image, container, and volume disk
 // consumption
-func DiskUsage(ctx context.Context, options *DiskOptions) (*entities.SystemDfReport, error) {
-	var report entities.SystemDfReport
+func DiskUsage(ctx context.Context, options *DiskOptions) (*types.SystemDfReport, error) {
+	var report types.SystemDfReport
 	if options == nil {
 		options = new(DiskOptions)
 	}

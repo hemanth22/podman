@@ -8,12 +8,12 @@ import (
 	"strings"
 
 	"github.com/containers/common/pkg/completion"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/parse"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/cmd/podman/validate"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/parse"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/docker/go-units"
 	"github.com/spf13/cobra"
 )
@@ -47,6 +47,7 @@ func init() {
 	flags := pruneCommand.Flags()
 	flags.BoolVarP(&force, "force", "f", false, "Do not prompt for confirmation.  The default is false")
 	flags.BoolVarP(&pruneOptions.All, "all", "a", false, "Remove all unused data")
+	flags.BoolVar(&pruneOptions.External, "external", false, "Remove container data in storage not controlled by podman")
 	flags.BoolVar(&pruneOptions.Volume, "volumes", false, "Prune volumes")
 	filterFlagName := "filter"
 	flags.StringArrayVar(&filters, filterFlagName, []string{}, "Provide filter values (e.g. 'label=<key>=<value>')")
@@ -55,8 +56,8 @@ func init() {
 
 func prune(cmd *cobra.Command, args []string) error {
 	var err error
-	// Prompt for confirmation if --force is not set
-	if !force {
+	// Prompt for confirmation if --force is not set, unless --external
+	if !force && !pruneOptions.External {
 		reader := bufio.NewReader(os.Stdin)
 		volumeString := ""
 		if pruneOptions.Volume {
@@ -75,6 +76,7 @@ func prune(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Remove all unused pods, containers, images, networks, and volume data.
 	pruneOptions.Filters, err = parse.FilterArgumentsIntoFilters(filters)
 	if err != nil {
 		return err
@@ -106,8 +108,15 @@ func prune(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Print Network prune results
+	err = utils.PrintNetworkPruneResults(response.NetworkPruneReports, true)
+	if err != nil {
+		return err
+	}
 
-	fmt.Printf("Total reclaimed space: %s\n", units.HumanSize((float64)(response.ReclaimedSpace)))
+	if !pruneOptions.External {
+		fmt.Printf("Total reclaimed space: %s\n", units.HumanSize((float64)(response.ReclaimedSpace)))
+	}
 	return nil
 }
 

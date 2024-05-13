@@ -3,9 +3,9 @@ package compat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,18 +16,20 @@ import (
 	"github.com/containers/buildah"
 	buildahDefine "github.com/containers/buildah/define"
 	"github.com/containers/buildah/pkg/parse"
+	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/auth"
-	"github.com/containers/podman/v4/pkg/channel"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/auth"
+	"github.com/containers/podman/v5/pkg/bindings/images"
+	"github.com/containers/podman/v5/pkg/channel"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/containers/storage/pkg/archive"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/gorilla/schema"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -49,7 +51,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	contextDirectory, err := extractTarFile(r)
+	anchorDir, err := os.MkdirTemp("", "libpod_builder")
 	if err != nil {
 		utils.InternalServerError(w, err)
 		return
@@ -63,11 +65,17 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		err := os.RemoveAll(filepath.Dir(contextDirectory))
+		err := os.RemoveAll(anchorDir)
 		if err != nil {
-			logrus.Warn(errors.Wrapf(err, "failed to remove build scratch directory %q", filepath.Dir(contextDirectory)))
+			logrus.Warn(fmt.Errorf("failed to remove build scratch directory %q: %w", anchorDir, err))
 		}
 	}()
+
+	contextDirectory, err := extractTarFile(anchorDir, r)
+	if err != nil {
+		utils.InternalServerError(w, err)
+		return
+	}
 
 	query := struct {
 		AddHosts                string   `schema:"extrahosts"`
@@ -78,15 +86,17 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		AppArmor                string   `schema:"apparmor"`
 		BuildArgs               string   `schema:"buildargs"`
 		CacheFrom               string   `schema:"cachefrom"`
-		CgroupParent            string   `schema:"cgroupparent"` // nolint
+		CacheTo                 string   `schema:"cacheto"`
+		CacheTTL                string   `schema:"cachettl"`
+		CgroupParent            string   `schema:"cgroupparent"`
 		Compression             uint64   `schema:"compression"`
 		ConfigureNetwork        string   `schema:"networkmode"`
 		CPPFlags                string   `schema:"cppflags"`
-		CpuPeriod               uint64   `schema:"cpuperiod"`  // nolint
-		CpuQuota                int64    `schema:"cpuquota"`   // nolint
-		CpuSetCpus              string   `schema:"cpusetcpus"` // nolint
-		CpuSetMems              string   `schema:"cpusetmems"` // nolint
-		CpuShares               uint64   `schema:"cpushares"`  // nolint
+		CpuPeriod               uint64   `schema:"cpuperiod"`  //nolint:revive,stylecheck
+		CpuQuota                int64    `schema:"cpuquota"`   //nolint:revive,stylecheck
+		CpuSetCpus              string   `schema:"cpusetcpus"` //nolint:revive,stylecheck
+		CpuSetMems              string   `schema:"cpusetmems"` //nolint:revive,stylecheck
+		CpuShares               uint64   `schema:"cpushares"`  //nolint:revive,stylecheck
 		DNSOptions              string   `schema:"dnsoptions"`
 		DNSSearch               string   `schema:"dnssearch"`
 		DNSServers              string   `schema:"dnsservers"`
@@ -97,13 +107,16 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		Excludes                string   `schema:"excludes"`
 		ForceRm                 bool     `schema:"forcerm"`
 		From                    string   `schema:"from"`
+		GroupAdd                []string `schema:"groupadd"`
 		HTTPProxy               bool     `schema:"httpproxy"`
+		IDMappingOptions        string   `schema:"idmappingoptions"`
 		IdentityLabel           bool     `schema:"identitylabel"`
 		Ignore                  bool     `schema:"ignore"`
 		Isolation               string   `schema:"isolation"`
-		Jobs                    int      `schema:"jobs"` // nolint
+		Jobs                    int      `schema:"jobs"`
 		LabelOpts               string   `schema:"labelopts"`
 		Labels                  string   `schema:"labels"`
+		LayerLabels             []string `schema:"layerLabel"`
 		Layers                  bool     `schema:"layers"`
 		LogRusage               bool     `schema:"rusage"`
 		Manifest                string   `schema:"manifest"`
@@ -111,6 +124,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		Memory                  int64    `schema:"memory"`
 		NamespaceOptions        string   `schema:"nsoptions"`
 		NoCache                 bool     `schema:"nocache"`
+		OmitHistory             bool     `schema:"omithistory"`
 		OSFeatures              []string `schema:"osfeature"`
 		OSVersion               string   `schema:"osversion"`
 		OutputFormat            string   `schema:"outputformat"`
@@ -126,6 +140,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		Secrets                 string   `schema:"secrets"`
 		SecurityOpt             string   `schema:"securityopt"`
 		ShmSize                 int      `schema:"shmsize"`
+		SkipUnusedStages        bool     `schema:"skipunusedstages"`
 		Squash                  bool     `schema:"squash"`
 		TLSVerify               bool     `schema:"tlsVerify"`
 		Tags                    []string `schema:"t"`
@@ -133,15 +148,19 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		Timestamp               int64    `schema:"timestamp"`
 		Ulimits                 string   `schema:"ulimits"`
 		UnsetEnvs               []string `schema:"unsetenv"`
+		UnsetLabels             []string `schema:"unsetlabel"`
+		Volumes                 []string `schema:"volume"`
 	}{
-		Dockerfile:    "Dockerfile",
-		IdentityLabel: true,
-		Registry:      "docker.io",
-		Rm:            true,
-		ShmSize:       64 * 1024 * 1024,
+		Dockerfile:       "Dockerfile",
+		IdentityLabel:    true,
+		Registry:         "docker.io",
+		Rm:               true,
+		ShmSize:          64 * 1024 * 1024,
+		TLSVerify:        true,
+		SkipUnusedStages: true,
 	}
 
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
 		utils.Error(w, http.StatusBadRequest, err)
 		return
@@ -176,13 +195,15 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 	dockerFileSet := false
 	if utils.IsLibpodRequest(r) && query.Remote != "" {
 		// The context directory could be a URL.  Try to handle that.
-		anchorDir, err := ioutil.TempDir(parse.GetTempDir(), "libpod_builder")
+		anchorDir, err := os.MkdirTemp(parse.GetTempDir(), "libpod_builder")
 		if err != nil {
 			utils.InternalServerError(w, err)
+			return
 		}
 		tempDir, subDir, err := buildahDefine.TempDirForURL(anchorDir, "buildah", query.Remote)
 		if err != nil {
 			utils.InternalServerError(w, err)
+			return
 		}
 		if tempDir != "" {
 			// We had to download it to a temporary directory.
@@ -200,6 +221,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 			absDir, err := filepath.Abs(query.Remote)
 			if err != nil {
 				utils.BadRequest(w, "remote", query.Remote, err)
+				return
 			}
 			contextDirectory = absDir
 		}
@@ -208,9 +230,17 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 			var m = []string{}
 			if err := json.Unmarshal([]byte(query.Dockerfile), &m); err != nil {
 				// it's not json, assume just a string
-				m = []string{filepath.Join(contextDirectory, query.Dockerfile)}
+				m = []string{query.Dockerfile}
 			}
-			containerFiles = m
+
+			for _, containerfile := range m {
+				// Add path to containerfile iff it is not URL
+				if !(strings.HasPrefix(containerfile, "http://") || strings.HasPrefix(containerfile, "https://")) {
+					containerfile = filepath.Join(contextDirectory,
+						filepath.Clean(filepath.FromSlash(containerfile)))
+				}
+				containerFiles = append(containerFiles, containerfile)
+			}
 			dockerFileSet = true
 		}
 	}
@@ -219,10 +249,11 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		containerFiles = []string{filepath.Join(contextDirectory, "Dockerfile")}
 		if utils.IsLibpodRequest(r) {
 			containerFiles = []string{filepath.Join(contextDirectory, "Containerfile")}
-			if _, err = os.Stat(containerFiles[0]); err != nil {
+			if err = fileutils.Exists(containerFiles[0]); err != nil {
 				containerFiles = []string{filepath.Join(contextDirectory, "Dockerfile")}
-				if _, err1 := os.Stat(containerFiles[0]); err1 != nil {
+				if err1 := fileutils.Exists(containerFiles[0]); err1 != nil {
 					utils.BadRequest(w, "dockerfile", query.Dockerfile, err)
+					return
 				}
 			}
 		}
@@ -306,15 +337,15 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 			if len(secretOpt) > 0 {
 				modifiedOpt := []string{}
 				for _, token := range secretOpt {
-					arr := strings.SplitN(token, "=", 2)
-					if len(arr) > 1 {
-						if arr[0] == "src" {
+					key, val, hasVal := strings.Cut(token, "=")
+					if hasVal {
+						if key == "src" {
 							/* move secret away from contextDir */
 							/* to make sure we dont accidentally commit temporary secrets to image*/
 							builderDirectory, _ := filepath.Split(contextDirectory)
 							// following path is outside build context
-							newSecretPath := filepath.Join(builderDirectory, arr[1])
-							oldSecretPath := filepath.Join(contextDirectory, arr[1])
+							newSecretPath := filepath.Join(builderDirectory, val)
+							oldSecretPath := filepath.Join(contextDirectory, val)
 							err := os.Rename(oldSecretPath, newSecretPath)
 							if err != nil {
 								utils.BadRequest(w, "secrets", query.Secrets, err)
@@ -337,7 +368,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 	if len(tags) > 0 {
 		possiblyNormalizedName, err := utils.NormalizeToDockerHub(r, tags[0])
 		if err != nil {
-			utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "error normalizing image"))
+			utils.Error(w, http.StatusInternalServerError, fmt.Errorf("normalizing image: %w", err))
 			return
 		}
 		output = possiblyNormalizedName
@@ -349,14 +380,23 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		var err error
 		isolation, err = parseLibPodIsolation(query.Isolation)
 		if err != nil {
-			utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "failed to parse isolation"))
+			utils.Error(w, http.StatusInternalServerError, fmt.Errorf("failed to parse isolation: %w", err))
 			return
 		}
 
-		// make sure to force rootless as rootless otherwise buildah runs code which is intended to be run only as root.
-		if isolation == buildah.IsolationOCI && rootless.IsRootless() {
-			isolation = buildah.IsolationOCIRootless
+		// Make sure to force rootless as rootless otherwise buildah runs code which is intended to be run only as root.
+		// Same the other way around: https://github.com/containers/podman/issues/22109
+		switch isolation {
+		case buildah.IsolationOCI:
+			if rootless.IsRootless() {
+				isolation = buildah.IsolationOCIRootless
+			}
+		case buildah.IsolationOCIRootless:
+			if !rootless.IsRootless() {
+				isolation = buildah.IsolationOCI
+			}
 		}
+
 		registry = ""
 		format = query.OutputFormat
 	} else {
@@ -366,11 +406,11 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	var additionalTags []string // nolint
+	var additionalTags []string
 	for i := 1; i < len(tags); i++ {
 		possiblyNormalizedTag, err := utils.NormalizeToDockerHub(r, tags[i])
 		if err != nil {
-			utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "error normalizing image"))
+			utils.Error(w, http.StatusInternalServerError, fmt.Errorf("normalizing image: %w", err))
 			return
 		}
 		additionalTags = append(additionalTags, possiblyNormalizedTag)
@@ -380,6 +420,49 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 	if _, found := r.URL.Query()["additionalbuildcontexts"]; found {
 		if err := json.Unmarshal([]byte(query.AdditionalBuildContexts), &additionalBuildContexts); err != nil {
 			utils.BadRequest(w, "additionalbuildcontexts", query.AdditionalBuildContexts, err)
+			return
+		}
+	}
+
+	var idMappingOptions buildahDefine.IDMappingOptions
+	if _, found := r.URL.Query()["idmappingoptions"]; found {
+		if err := json.Unmarshal([]byte(query.IDMappingOptions), &idMappingOptions); err != nil {
+			utils.BadRequest(w, "idmappingoptions", query.IDMappingOptions, err)
+			return
+		}
+	}
+
+	cacheFrom := []reference.Named{}
+	if _, found := r.URL.Query()["cachefrom"]; found {
+		var cacheFromSrcList []string
+		if err := json.Unmarshal([]byte(query.CacheFrom), &cacheFromSrcList); err != nil {
+			utils.BadRequest(w, "cacheFrom", query.CacheFrom, err)
+			return
+		}
+		cacheFrom, err = parse.RepoNamesToNamedReferences(cacheFromSrcList)
+		if err != nil {
+			utils.BadRequest(w, "cacheFrom", query.CacheFrom, err)
+			return
+		}
+	}
+	cacheTo := []reference.Named{}
+	if _, found := r.URL.Query()["cacheto"]; found {
+		var cacheToDestList []string
+		if err := json.Unmarshal([]byte(query.CacheTo), &cacheToDestList); err != nil {
+			utils.BadRequest(w, "cacheTo", query.CacheTo, err)
+			return
+		}
+		cacheTo, err = parse.RepoNamesToNamedReferences(cacheToDestList)
+		if err != nil {
+			utils.BadRequest(w, "cacheto", query.CacheTo, err)
+			return
+		}
+	}
+	var cacheTTL time.Duration
+	if _, found := r.URL.Query()["cachettl"]; found {
+		cacheTTL, err = time.ParseDuration(query.CacheTTL)
+		if err != nil {
+			utils.BadRequest(w, "cachettl", query.CacheTTL, err)
 			return
 		}
 	}
@@ -484,21 +567,21 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 					utils.BadRequest(w, "securityopt", query.SecurityOpt, errors.New("no-new-privileges is not supported"))
 					return
 				}
-				con := strings.SplitN(opt, "=", 2)
-				if len(con) != 2 {
-					utils.BadRequest(w, "securityopt", query.SecurityOpt, errors.Errorf("Invalid --security-opt name=value pair: %q", opt))
+				name, value, hasValue := strings.Cut(opt, "=")
+				if !hasValue {
+					utils.BadRequest(w, "securityopt", query.SecurityOpt, fmt.Errorf("invalid --security-opt name=value pair: %q", opt))
 					return
 				}
 
-				switch con[0] {
+				switch name {
 				case "label":
-					labelOpts = append(labelOpts, con[1])
+					labelOpts = append(labelOpts, value)
 				case "apparmor":
-					apparmor = con[1]
+					apparmor = value
 				case "seccomp":
-					seccomp = con[1]
+					seccomp = value
 				default:
-					utils.BadRequest(w, "securityopt", query.SecurityOpt, errors.Errorf("Invalid --security-opt 2: %q", opt))
+					utils.BadRequest(w, "securityopt", query.SecurityOpt, fmt.Errorf("invalid --security-opt 2: %q", opt))
 					return
 				}
 			}
@@ -539,7 +622,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 	if fromImage != "" {
 		possiblyNormalizedName, err := utils.NormalizeToDockerHub(r, fromImage)
 		if err != nil {
-			utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "error normalizing image"))
+			utils.Error(w, http.StatusInternalServerError, fmt.Errorf("normalizing image: %w", err))
 			return
 		}
 		fromImage = possiblyNormalizedName
@@ -569,6 +652,12 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 	reporter := channel.NewWriter(make(chan []byte))
 	defer reporter.Close()
 
+	_, ignoreFile, err := util.ParseDockerignore(containerFiles, contextDirectory)
+	if err != nil {
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("processing ignore file: %w", err))
+		return
+	}
+
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 	buildOptions := buildahDefine.BuildOptions{
 		AddCapabilities:         addCaps,
@@ -576,6 +665,9 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		AdditionalTags:          additionalTags,
 		Annotations:             annotations,
 		CPPFlags:                cppflags,
+		CacheFrom:               cacheFrom,
+		CacheTo:                 cacheTo,
+		CacheTTL:                cacheTTL,
 		Args:                    buildArgs,
 		AllPlatforms:            query.AllPlatforms,
 		CommonBuildOpts: &buildah.CommonBuildOptions{
@@ -595,10 +687,12 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 			LabelOpts:          labelOpts,
 			Memory:             query.Memory,
 			MemorySwap:         query.MemSwap,
+			OmitHistory:        query.OmitHistory,
 			SeccompProfilePath: seccomp,
 			ShmSize:            strconv.Itoa(query.ShmSize),
 			Ulimit:             ulimits,
 			Secrets:            secrets,
+			Volumes:            query.Volumes,
 		},
 		Compression:                    compression,
 		ConfigureNetwork:               parseNetworkConfigurationPolicy(query.ConfigureNetwork),
@@ -609,11 +703,15 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		Err:                            auxout,
 		Excludes:                       excludes,
 		ForceRmIntermediateCtrs:        query.ForceRm,
+		GroupAdd:                       query.GroupAdd,
 		From:                           fromImage,
+		IDMappingOptions:               &idMappingOptions,
 		IgnoreUnrecognizedInstructions: query.Ignore,
+		IgnoreFile:                     ignoreFile,
 		Isolation:                      isolation,
 		Jobs:                           &jobs,
 		Labels:                         labels,
+		LayerLabels:                    query.LayerLabels,
 		Layers:                         query.Layers,
 		LogRusage:                      query.LogRusage,
 		Manifest:                       query.Manifest,
@@ -632,10 +730,12 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		RemoveIntermediateCtrs:         query.Rm,
 		ReportWriter:                   reporter,
 		RusageLogFile:                  query.RusageLogFile,
+		SkipUnusedStages:               types.NewOptionalBool(query.SkipUnusedStages),
 		Squash:                         query.Squash,
 		SystemContext:                  systemContext,
 		Target:                         query.Target,
 		UnsetEnvs:                      query.UnsetEnvs,
+		UnsetLabels:                    query.UnsetLabels,
 	}
 
 	for _, platformSpec := range query.Platform {
@@ -660,7 +760,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 		success bool
 	)
 
-	runCtx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(r.Context())
 	go func() {
 		defer cancel()
 		imageID, _, err = runtime.Build(r.Context(), buildOptions, containerFiles...)
@@ -686,7 +786,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 	if logrus.IsLevelEnabled(logrus.DebugLevel) {
 		if v, found := os.LookupEnv("PODMAN_RETAIN_BUILD_ARTIFACT"); found {
 			if keep, _ := strconv.ParseBool(v); keep {
-				t, _ := ioutil.TempFile("", "build_*_server")
+				t, _ := os.CreateTemp("", "build_*_server")
 				defer t.Close()
 				body = io.MultiWriter(t, w)
 			}
@@ -698,14 +798,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 	var stepErrors []string
 
 	for {
-		type BuildResponse struct {
-			Stream string                 `json:"stream,omitempty"`
-			Error  *jsonmessage.JSONError `json:"errorDetail,omitempty"`
-			// NOTE: `error` is being deprecated check https://github.com/moby/moby/blob/master/pkg/jsonmessage/jsonmessage.go#L148
-			ErrorMessage string          `json:"error,omitempty"` // deprecate this slowly
-			Aux          json.RawMessage `json:"aux,omitempty"`
-		}
-		m := BuildResponse{}
+		m := images.BuildResponse{}
 
 		select {
 		case e := <-stdout.Chan():
@@ -735,7 +828,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 			// output all step errors irrespective of quiet
 			// flag.
 			for _, stepError := range stepErrors {
-				t := BuildResponse{}
+				t := images.BuildResponse{}
 				t.Stream = stepError
 				if err := enc.Encode(t); err != nil {
 					stderr.Write([]byte(err.Error()))
@@ -744,7 +837,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 			}
 			m.ErrorMessage = string(e)
 			m.Error = &jsonmessage.JSONError{
-				Message: m.ErrorMessage,
+				Message: string(e),
 			}
 			if err := enc.Encode(m); err != nil {
 				logrus.Warnf("Failed to json encode error %v", err)
@@ -758,6 +851,7 @@ func BuildImage(w http.ResponseWriter, r *http.Request) {
 					if err := enc.Encode(m); err != nil {
 						logrus.Warnf("failed to json encode error %v", err)
 					}
+					flush()
 					m.Aux = nil
 					m.Stream = fmt.Sprintf("Successfully built %12.12s\n", imageID)
 					if err := enc.Encode(m); err != nil {
@@ -799,41 +893,20 @@ func parseNetworkConfigurationPolicy(network string) buildah.NetworkConfiguratio
 	}
 }
 
-func parseLibPodIsolation(isolation string) (buildah.Isolation, error) { // nolint
+func parseLibPodIsolation(isolation string) (buildah.Isolation, error) {
 	if val, err := strconv.Atoi(isolation); err == nil {
 		return buildah.Isolation(val), nil
 	}
 	return parse.IsolationOption(isolation)
 }
 
-func extractTarFile(r *http.Request) (string, error) {
-	// build a home for the request body
-	anchorDir, err := ioutil.TempDir("", "libpod_builder")
-	if err != nil {
-		return "", err
-	}
-
-	path := filepath.Join(anchorDir, "tarBall")
-	tarBall, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return "", err
-	}
-	defer tarBall.Close()
-
-	// Content-Length not used as too many existing API clients didn't honor it
-	_, err = io.Copy(tarBall, r.Body)
-	r.Body.Close()
-	if err != nil {
-		return "", fmt.Errorf("failed Request: Unable to copy tar file from request body %s", r.RequestURI)
-	}
-
+func extractTarFile(anchorDir string, r *http.Request) (string, error) {
 	buildDir := filepath.Join(anchorDir, "build")
-	err = os.Mkdir(buildDir, 0o700)
+	err := os.Mkdir(buildDir, 0o700)
 	if err != nil {
 		return "", err
 	}
 
-	_, _ = tarBall.Seek(0, 0)
-	err = archive.Untar(tarBall, buildDir, nil)
+	err = archive.Untar(r.Body, buildDir, nil)
 	return buildDir, err
 }

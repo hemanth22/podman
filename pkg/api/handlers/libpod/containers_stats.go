@@ -2,17 +2,18 @@ package libpod
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/containers/common/pkg/cgroups"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/pkg/rootless"
 	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -24,8 +25,7 @@ func StatsContainer(w http.ResponseWriter, r *http.Request) {
 	if rootless.IsRootless() {
 		// if so, then verify cgroup v2 available (more expensive check)
 		if isV2, _ := cgroups.IsCgroup2UnifiedMode(); !isV2 {
-			msg := "Container stats resource only available for cgroup v2"
-			utils.Error(w, http.StatusConflict, errors.New(msg))
+			utils.Error(w, http.StatusConflict, errors.New("container stats resource only available for cgroup v2"))
 			return
 		}
 	}
@@ -34,12 +34,14 @@ func StatsContainer(w http.ResponseWriter, r *http.Request) {
 		Containers []string `schema:"containers"`
 		Stream     bool     `schema:"stream"`
 		Interval   int      `schema:"interval"`
+		All        bool     `schema:"all"`
 	}{
 		Stream:   true,
 		Interval: 5,
+		All:      false,
 	}
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusBadRequest, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
@@ -50,6 +52,7 @@ func StatsContainer(w http.ResponseWriter, r *http.Request) {
 	statsOptions := entities.ContainerStatsOptions{
 		Stream:   query.Stream,
 		Interval: query.Interval,
+		All:      query.All,
 	}
 
 	// Stats will stop if the connection is closed.
@@ -66,7 +69,7 @@ func StatsContainer(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	// Setup JSON encoder for streaming.
+	// Set up JSON encoder for streaming.
 	coder := json.NewEncoder(w)
 	coder.SetEscapeHTML(true)
 

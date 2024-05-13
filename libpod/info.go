@@ -1,31 +1,28 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
-	"os/exec"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/containers/buildah"
-	"github.com/containers/common/pkg/apparmor"
-	"github.com/containers/common/pkg/cgroups"
-	"github.com/containers/common/pkg/seccomp"
+	"github.com/containers/buildah/pkg/parse"
+	"github.com/containers/buildah/pkg/util"
+	"github.com/containers/common/pkg/version"
 	"github.com/containers/image/v5/pkg/sysregistriesv2"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/linkmode"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/linkmode"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/system"
-	"github.com/opencontainers/selinux/go-selinux"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -34,20 +31,20 @@ func (r *Runtime) info() (*define.Info, error) {
 	info := define.Info{}
 	versionInfo, err := define.GetVersion()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting version info")
+		return nil, fmt.Errorf("getting version info: %w", err)
 	}
 	info.Version = versionInfo
 	// get host information
 	hostInfo, err := r.hostInfo()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting host info")
+		return nil, fmt.Errorf("getting host info: %w", err)
 	}
 	info.Host = hostInfo
 
 	// get store information
 	storeInfo, err := r.storeInfo()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting store info")
+		return nil, fmt.Errorf("getting store info: %w", err)
 	}
 	info.Store = storeInfo
 	registries := make(map[string]interface{})
@@ -55,14 +52,14 @@ func (r *Runtime) info() (*define.Info, error) {
 	sys := r.SystemContext()
 	data, err := sysregistriesv2.GetRegistries(sys)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting registries")
+		return nil, fmt.Errorf("getting registries: %w", err)
 	}
 	for _, reg := range data {
 		registries[reg.Prefix] = reg
 	}
 	regs, err := sysregistriesv2.UnqualifiedSearchRegistries(sys)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting registries")
+		return nil, fmt.Errorf("getting registries: %w", err)
 	}
 	if len(regs) > 0 {
 		registries["search"] = regs
@@ -83,112 +80,63 @@ func (r *Runtime) info() (*define.Info, error) {
 
 // top-level "host" info
 func (r *Runtime) hostInfo() (*define.HostInfo, error) {
-	// lets say OS, arch, number of cpus, amount of memory, maybe os distribution/version, hostname, kernel version, uptime
+	// let's say OS, arch, number of cpus, amount of memory, maybe os distribution/version, hostname, kernel version, uptime
 	mi, err := system.ReadMemInfo()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error reading memory info")
+		return nil, fmt.Errorf("reading memory info: %w", err)
 	}
 
 	hostDistributionInfo := r.GetHostDistributionInfo()
 
-	kv, err := readKernelVersion()
+	kv, err := util.ReadKernelVersion()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error reading kernel version")
+		return nil, fmt.Errorf("reading kernel version: %w", err)
 	}
 
 	host, err := os.Hostname()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting hostname")
+		return nil, fmt.Errorf("getting hostname: %w", err)
 	}
 
-	seccompProfilePath, err := DefaultSeccompPath()
-	if err != nil {
-		return nil, errors.Wrapf(err, "error getting Seccomp profile path")
-	}
-
-	// Cgroups version
-	unified, err := cgroups.IsCgroup2UnifiedMode()
-	if err != nil {
-		return nil, errors.Wrapf(err, "error reading cgroups mode")
-	}
-
-	// Get Map of all available controllers
-	availableControllers, err := cgroups.GetAvailableControllers(nil, unified)
-	if err != nil {
-		return nil, errors.Wrapf(err, "error getting available cgroup controllers")
-	}
 	cpuUtil, err := getCPUUtilization()
 	if err != nil {
 		return nil, err
 	}
+
+	locksFree, err := r.lockManager.AvailableLocks()
+	if err != nil {
+		return nil, fmt.Errorf("getting free locks: %w", err)
+	}
+
 	info := define.HostInfo{
-		Arch:              runtime.GOARCH,
-		BuildahVersion:    buildah.Version,
-		CgroupManager:     r.config.Engine.CgroupManager,
-		CgroupControllers: availableControllers,
-		Linkmode:          linkmode.Linkmode(),
-		CPUs:              runtime.NumCPU(),
-		CPUUtilization:    cpuUtil,
-		Distribution:      hostDistributionInfo,
-		LogDriver:         r.config.Containers.LogDriver,
-		EventLogger:       r.eventer.String(),
-		Hostname:          host,
-		IDMappings:        define.IDMappings{},
-		Kernel:            kv,
-		MemFree:           mi.MemFree,
-		MemTotal:          mi.MemTotal,
-		NetworkBackend:    r.config.Network.NetworkBackend,
-		OS:                runtime.GOOS,
-		Security: define.SecurityInfo{
-			AppArmorEnabled:     apparmor.IsEnabled(),
-			DefaultCapabilities: strings.Join(r.config.Containers.DefaultCapabilities, ","),
-			Rootless:            rootless.IsRootless(),
-			SECCOMPEnabled:      seccomp.IsEnabled(),
-			SECCOMPProfilePath:  seccompProfilePath,
-			SELinuxEnabled:      selinux.GetEnabled(),
-		},
-		Slirp4NetNS: define.SlirpInfo{},
-		SwapFree:    mi.SwapFree,
-		SwapTotal:   mi.SwapTotal,
+		Arch:               runtime.GOARCH,
+		BuildahVersion:     buildah.Version,
+		DatabaseBackend:    r.config.Engine.DBBackend,
+		Linkmode:           linkmode.Linkmode(),
+		CPUs:               runtime.NumCPU(),
+		CPUUtilization:     cpuUtil,
+		Distribution:       hostDistributionInfo,
+		LogDriver:          r.config.Containers.LogDriver,
+		EventLogger:        r.eventer.String(),
+		FreeLocks:          locksFree,
+		Hostname:           host,
+		Kernel:             kv,
+		MemFree:            mi.MemFree,
+		MemTotal:           mi.MemTotal,
+		NetworkBackend:     r.config.Network.NetworkBackend,
+		NetworkBackendInfo: r.network.NetworkInfo(),
+		OS:                 runtime.GOOS,
+		RootlessNetworkCmd: r.config.Network.DefaultRootlessNetworkCmd,
+		SwapFree:           mi.SwapFree,
+		SwapTotal:          mi.SwapTotal,
 	}
-
-	cgroupVersion := "v1"
-	if unified {
-		cgroupVersion = "v2"
+	platform := parse.DefaultPlatform()
+	pArr := strings.Split(platform, "/")
+	if len(pArr) == 3 {
+		info.Variant = pArr[2]
 	}
-	info.CgroupsVersion = cgroupVersion
-
-	slirp4netnsPath := r.config.Engine.NetworkCmdPath
-	if slirp4netnsPath == "" {
-		slirp4netnsPath, _ = exec.LookPath("slirp4netns")
-	}
-	if slirp4netnsPath != "" {
-		version, err := programVersion(slirp4netnsPath)
-		if err != nil {
-			logrus.Warnf("Failed to retrieve program version for %s: %v", slirp4netnsPath, err)
-		}
-		program := define.SlirpInfo{
-			Executable: slirp4netnsPath,
-			Package:    packageVersion(slirp4netnsPath),
-			Version:    version,
-		}
-		info.Slirp4NetNS = program
-	}
-
-	if rootless.IsRootless() {
-		uidmappings, err := rootless.ReadMappingsProc("/proc/self/uid_map")
-		if err != nil {
-			return nil, errors.Wrapf(err, "error reading uid mappings")
-		}
-		gidmappings, err := rootless.ReadMappingsProc("/proc/self/gid_map")
-		if err != nil {
-			return nil, errors.Wrapf(err, "error reading gid mappings")
-		}
-		idmappings := define.IDMappings{
-			GIDMap: gidmappings,
-			UIDMap: uidmappings,
-		}
-		info.IDMappings = idmappings
+	if err := r.setPlatformHostInfo(&info); err != nil {
+		return nil, err
 	}
 
 	conmonInfo, ociruntimeInfo, err := r.defaultOCIRuntime.RuntimeInfo()
@@ -199,9 +147,9 @@ func (r *Runtime) hostInfo() (*define.HostInfo, error) {
 		info.OCIRuntime = ociruntimeInfo
 	}
 
-	duration, err := procUptime()
+	duration, err := util.ReadUptime()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error reading up time")
+		return nil, fmt.Errorf("reading up time: %w", err)
 	}
 
 	uptime := struct {
@@ -240,7 +188,7 @@ func (r *Runtime) getContainerStoreInfo() (define.ContainerStore, error) {
 	for _, con := range cons {
 		state, err := con.State()
 		if err != nil {
-			if errors.Cause(err) == define.ErrNoSuchCtr {
+			if errors.Is(err, define.ErrNoSuchCtr) {
 				// container was probably removed
 				cs.Number--
 				continue
@@ -264,14 +212,14 @@ func (r *Runtime) getContainerStoreInfo() (define.ContainerStore, error) {
 
 // top-level "store" info
 func (r *Runtime) storeInfo() (*define.StoreInfo, error) {
-	// lets say storage driver in use, number of images, number of containers
-	configFile, err := storage.DefaultConfigFile(rootless.IsRootless())
+	// let's say storage driver in use, number of images, number of containers
+	configFile, err := storage.DefaultConfigFile()
 	if err != nil {
 		return nil, err
 	}
 	images, err := r.store.Images()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error getting number of images")
+		return nil, fmt.Errorf("getting number of images: %w", err)
 	}
 	conInfo, err := r.getContainerStoreInfo()
 	if err != nil {
@@ -281,7 +229,7 @@ func (r *Runtime) storeInfo() (*define.StoreInfo, error) {
 
 	var grStats syscall.Statfs_t
 	if err := syscall.Statfs(r.store.GraphRoot(), &grStats); err != nil {
-		return nil, errors.Wrapf(err, "unable to collect graph root usasge for %q", r.store.GraphRoot())
+		return nil, fmt.Errorf("unable to collect graph root usasge for %q: %w", r.store.GraphRoot(), err)
 	}
 	allocated := uint64(grStats.Bsize) * grStats.Blocks
 	info := define.StoreInfo{
@@ -296,20 +244,21 @@ func (r *Runtime) storeInfo() (*define.StoreInfo, error) {
 		GraphOptions:       nil,
 		VolumePath:         r.config.Engine.VolumePath,
 		ConfigFile:         configFile,
+		TransientStore:     r.store.TransientStore(),
 	}
 
 	graphOptions := map[string]interface{}{}
 	for _, o := range r.store.GraphOptions() {
 		split := strings.SplitN(o, "=", 2)
 		if strings.HasSuffix(split[0], "mount_program") {
-			version, err := programVersion(split[1])
+			ver, err := version.Program(split[1])
 			if err != nil {
 				logrus.Warnf("Failed to retrieve program version for %s: %v", split[1], err)
 			}
 			program := map[string]interface{}{}
 			program["Executable"] = split[1]
-			program["Version"] = version
-			program["Package"] = packageVersion(split[1])
+			program["Version"] = ver
+			program["Package"] = version.Package(split[1])
 			graphOptions[split[0]] = program
 		} else {
 			graphOptions[split[0]] = split[1]
@@ -329,31 +278,6 @@ func (r *Runtime) storeInfo() (*define.StoreInfo, error) {
 	return &info, nil
 }
 
-func readKernelVersion() (string, error) {
-	buf, err := ioutil.ReadFile("/proc/version")
-	if err != nil {
-		return "", err
-	}
-	f := bytes.Fields(buf)
-	if len(f) < 3 {
-		return string(bytes.TrimSpace(buf)), nil
-	}
-	return string(f[2]), nil
-}
-
-func procUptime() (time.Duration, error) {
-	var zero time.Duration
-	buf, err := ioutil.ReadFile("/proc/uptime")
-	if err != nil {
-		return zero, err
-	}
-	f := bytes.Fields(buf)
-	if len(f) < 1 {
-		return zero, errors.New("unable to parse uptime from /proc/uptime")
-	}
-	return time.ParseDuration(string(f[0]) + "s")
-}
-
 // GetHostDistributionInfo returns a map containing the host's distribution and version
 func (r *Runtime) GetHostDistributionInfo() define.DistributionInfo {
 	// Populate values in case we cannot find the values
@@ -371,7 +295,7 @@ func (r *Runtime) GetHostDistributionInfo() define.DistributionInfo {
 	l := bufio.NewScanner(f)
 	for l.Scan() {
 		if strings.HasPrefix(l.Text(), "ID=") {
-			dist.Distribution = strings.TrimPrefix(l.Text(), "ID=")
+			dist.Distribution = strings.Trim(strings.TrimPrefix(l.Text(), "ID="), "\"")
 		}
 		if strings.HasPrefix(l.Text(), "VARIANT_ID=") {
 			dist.Variant = strings.Trim(strings.TrimPrefix(l.Text(), "VARIANT_ID="), "\"")
@@ -384,44 +308,4 @@ func (r *Runtime) GetHostDistributionInfo() define.DistributionInfo {
 		}
 	}
 	return dist
-}
-
-// getCPUUtilization Returns a CPUUsage object that summarizes CPU
-// usage for userspace, system, and idle time.
-func getCPUUtilization() (*define.CPUUsage, error) {
-	f, err := os.Open("/proc/stat")
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	// Read first line of /proc/stat that has entries for system ("cpu" line)
-	for scanner.Scan() {
-		break
-	}
-	// column 1 is user, column 3 is system, column 4 is idle
-	stats := strings.Fields(scanner.Text())
-	return statToPercent(stats)
-}
-
-func statToPercent(stats []string) (*define.CPUUsage, error) {
-	userTotal, err := strconv.ParseFloat(stats[1], 64)
-	if err != nil {
-		return nil, errors.Wrapf(err, "unable to parse user value %q", stats[1])
-	}
-	systemTotal, err := strconv.ParseFloat(stats[3], 64)
-	if err != nil {
-		return nil, errors.Wrapf(err, "unable to parse system value %q", stats[3])
-	}
-	idleTotal, err := strconv.ParseFloat(stats[4], 64)
-	if err != nil {
-		return nil, errors.Wrapf(err, "unable to parse idle value %q", stats[4])
-	}
-	total := userTotal + systemTotal + idleTotal
-	s := define.CPUUsage{
-		UserPercent:   math.Round((userTotal/total*100)*100) / 100,
-		SystemPercent: math.Round((systemTotal/total*100)*100) / 100,
-		IdlePercent:   math.Round((idleTotal/total*100)*100) / 100,
-	}
-	return &s, nil
 }

@@ -1,13 +1,13 @@
-// nolint
 // most of these validate and parse functions have been taken from projectatomic/docker
 // and modified for cri-o
 package parse
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
 	"testing"
 
+	"github.com/containers/common/libnetwork/etchosts"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -16,14 +16,13 @@ var (
 )
 
 func createTmpFile(content []byte) (string, error) {
-	tmpfile, err := ioutil.TempFile(os.TempDir(), "unittest")
+	tmpfile, err := os.CreateTemp(os.TempDir(), "unittest")
 	if err != nil {
 		return "", err
 	}
 
 	if _, err := tmpfile.Write(content); err != nil {
 		return "", err
-
 	}
 	if err := tmpfile.Close(); err != nil {
 		return "", err
@@ -54,6 +53,7 @@ func TestValidateExtraHost(t *testing.T) {
 		{name: "bad-ipv6", args: args{val: "foobar:0db8:85a3:0000:0000:8a2e:0370:7334.0000.0000.000"}, want: "", wantErr: true},
 		{name: "noname-ipv6", args: args{val: "2001:0db8:85a3:0000:0000:8a2e:0370:7334"}, want: "", wantErr: true},
 		{name: "noname-ipv6", args: args{val: ":2001:0db8:85a3:0000:0000:8a2e:0370:7334"}, want: "", wantErr: true},
+		{name: "host-gateway", args: args{val: "foobar:host-gateway"}, want: fmt.Sprintf("foobar:%s", etchosts.HostGateway), wantErr: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

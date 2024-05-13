@@ -4,7 +4,7 @@ package system
 import (
 	"net/url"
 
-	"github.com/containers/podman/v4/pkg/bindings/internal/util"
+	"github.com/containers/podman/v5/pkg/bindings/internal/util"
 )
 
 // Changed returns true if named field has been set
@@ -60,4 +60,19 @@ func (o *PruneOptions) GetVolumes() bool {
 		return z
 	}
 	return *o.Volumes
+}
+
+// WithExternal set field External to given value
+func (o *PruneOptions) WithExternal(value bool) *PruneOptions {
+	o.External = &value
+	return o
+}
+
+// GetExternal returns value of field External
+func (o *PruneOptions) GetExternal() bool {
+	if o.External == nil {
+		var z bool
+		return z
+	}
+	return *o.External
 }

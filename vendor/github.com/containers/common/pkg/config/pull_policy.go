@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 )
 
 // PullPolicy determines how and which images are being pulled from a container
@@ -15,18 +16,18 @@ import (
 type PullPolicy int
 
 const (
-	// Always pull the image.
+	// Always pull the image and throw an error if the pull fails.
 	PullPolicyAlways PullPolicy = iota
 	// Pull the image only if it could not be found in the local containers
-	// storage.
+	// storage.  Throw an error if no image could be found and the pull fails.
 	PullPolicyMissing
 	// Never pull the image but use the one from the local containers
-	// storage.
+	// storage.  Throw an error if no image could be found.
 	PullPolicyNever
-	// Pull if the image on the registry is new than the one in the local
+	// Pull if the image on the registry is newer than the one in the local
 	// containers storage.  An image is considered to be newer when the
 	// digests are different.  Comparing the time stamps is prone to
-	// errors.
+	// errors.  Pull errors are suppressed if a local image was found.
 	PullPolicyNewer
 
 	// Ideally this should be the first `ioata` but backwards compatibility
@@ -73,14 +74,14 @@ func (p PullPolicy) Validate() error {
 // * "newer"   <-> PullPolicyNewer (also "ifnewer")
 // * "never"   <-> PullPolicyNever
 func ParsePullPolicy(s string) (PullPolicy, error) {
-	switch s {
-	case "always", "Always":
+	switch strings.ToLower(s) {
+	case "always":
 		return PullPolicyAlways, nil
-	case "missing", "Missing", "ifnotpresent", "IfNotPresent", "":
+	case "missing", "ifmissing", "ifnotpresent", "":
 		return PullPolicyMissing, nil
-	case "newer", "Newer", "ifnewer", "IfNewer":
+	case "newer", "ifnewer":
 		return PullPolicyNewer, nil
-	case "never", "Never":
+	case "never":
 		return PullPolicyNever, nil
 	default:
 		return PullPolicyUnsupported, fmt.Errorf("unsupported pull policy %q", s)

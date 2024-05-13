@@ -2,9 +2,10 @@
 package images
 
 import (
+	"io"
 	"net/url"
 
-	"github.com/containers/podman/v4/pkg/bindings/internal/util"
+	"github.com/containers/podman/v5/pkg/bindings/internal/util"
 )
 
 // Changed returns true if named field has been set
@@ -107,6 +108,21 @@ func (o *PullOptions) GetPassword() string {
 	return *o.Password
 }
 
+// WithProgressWriter set field ProgressWriter to given value
+func (o *PullOptions) WithProgressWriter(value io.Writer) *PullOptions {
+	o.ProgressWriter = &value
+	return o
+}
+
+// GetProgressWriter returns value of field ProgressWriter
+func (o *PullOptions) GetProgressWriter() io.Writer {
+	if o.ProgressWriter == nil {
+		var z io.Writer
+		return z
+	}
+	return *o.ProgressWriter
+}
+
 // WithQuiet set field Quiet to given value
 func (o *PullOptions) WithQuiet(value bool) *PullOptions {
 	o.Quiet = &value
@@ -120,6 +136,36 @@ func (o *PullOptions) GetQuiet() bool {
 		return z
 	}
 	return *o.Quiet
+}
+
+// WithRetry set field Retry to given value
+func (o *PullOptions) WithRetry(value uint) *PullOptions {
+	o.Retry = &value
+	return o
+}
+
+// GetRetry returns value of field Retry
+func (o *PullOptions) GetRetry() uint {
+	if o.Retry == nil {
+		var z uint
+		return z
+	}
+	return *o.Retry
+}
+
+// WithRetryDelay set field RetryDelay to given value
+func (o *PullOptions) WithRetryDelay(value string) *PullOptions {
+	o.RetryDelay = &value
+	return o
+}
+
+// GetRetryDelay returns value of field RetryDelay
+func (o *PullOptions) GetRetryDelay() string {
+	if o.RetryDelay == nil {
+		var z string
+		return z
+	}
+	return *o.RetryDelay
 }
 
 // WithSkipTLSVerify set field SkipTLSVerify to given value

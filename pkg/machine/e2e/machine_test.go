@@ -1,19 +1,19 @@
-package e2e
+package e2e_test
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
-	url2 "net/url"
 	"os"
-	"path"
 	"path/filepath"
-	"strings"
+	"runtime"
 	"testing"
-	"time"
 
-	"github.com/containers/podman/v4/pkg/machine"
-	. "github.com/onsi/ginkgo"
+	"github.com/containers/podman/v5/pkg/machine/compression"
+	"github.com/containers/podman/v5/pkg/machine/define"
+	"github.com/containers/podman/v5/pkg/machine/provider"
+	"github.com/containers/podman/v5/pkg/machine/vmconfigs"
+	"github.com/containers/podman/v5/utils"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -22,11 +22,11 @@ func TestMain(m *testing.M) {
 }
 
 const (
-	defaultStream string = "podman-testing"
+	defaultDiskSize uint = 11
 )
 
 var (
-	tmpDir         = "/var/tmp"
+	tmpDir         = os.TempDir()
 	fqImageName    string
 	suiteImageName string
 )
@@ -43,41 +43,33 @@ func TestMachine(t *testing.T) {
 	RunSpecs(t, "Podman Machine tests")
 }
 
+var testProvider vmconfigs.VMProvider
+
 var _ = BeforeSuite(func() {
-	fcd, err := machine.GetFCOSDownload(defaultStream)
+	var (
+		err       error
+		pullError error
+	)
+	testProvider, err = provider.Get()
 	if err != nil {
-		Fail("unable to get virtual machine image")
+		Fail("unable to create testProvider")
 	}
-	suiteImageName = strings.TrimSuffix(path.Base(fcd.Location), ".xz")
-	fqImageName = filepath.Join(tmpDir, suiteImageName)
-	if _, err := os.Stat(fqImageName); err != nil {
-		if os.IsNotExist(err) {
-			getMe, err := url2.Parse(fcd.Location)
-			if err != nil {
-				Fail(fmt.Sprintf("unable to create url for download: %q", err))
-			}
-			now := time.Now()
-			if err := machine.DownloadVMImage(getMe, fqImageName+".xz"); err != nil {
-				Fail(fmt.Sprintf("unable to download machine image: %q", err))
-			}
-			fmt.Println("Download took: ", time.Since(now).String())
-			if err := machine.Decompress(fqImageName+".xz", fqImageName); err != nil {
-				Fail(fmt.Sprintf("unable to decompress image file: %q", err))
-			}
-		} else {
-			Fail(fmt.Sprintf("unable to check for cache image: %q", err))
-		}
+	if testProvider.VMType() == define.WSLVirt {
+		pullError = pullWSLDisk()
+	} else {
+		pullError = pullOCITestDisk(tmpDir, testProvider.VMType())
 	}
+	if pullError != nil {
+		Fail(fmt.Sprintf("failed to pull wsl disk: %q", pullError))
+	}
+
 })
 
-var _ = SynchronizedAfterSuite(func() {},
-	func() {
-		fmt.Println("After")
-	})
+var _ = SynchronizedAfterSuite(func() {}, func() {})
 
 func setup() (string, *machineTestBuilder) {
 	// Set TMPDIR if this needs a new directory
-	homeDir, err := ioutil.TempDir("", "podman_test")
+	homeDir, err := os.MkdirTemp("", "podman_test")
 	if err != nil {
 		Fail(fmt.Sprintf("failed to create home directory: %q", err))
 	}
@@ -97,6 +89,14 @@ func setup() (string, *machineTestBuilder) {
 	if err := os.Setenv("HOME", homeDir); err != nil {
 		Fail("failed to set home dir")
 	}
+	if runtime.GOOS == "windows" {
+		if err := os.Setenv("USERPROFILE", homeDir); err != nil {
+			Fail("unable to set home dir on windows")
+		}
+	}
+	if err := os.Setenv("XDG_RUNTIME_DIR", homeDir); err != nil {
+		Fail("failed to set xdg_runtime dir")
+	}
 	if err := os.Unsetenv("SSH_AUTH_SOCK"); err != nil {
 		Fail("unable to unset SSH_AUTH_SOCK")
 	}
@@ -104,33 +104,68 @@ func setup() (string, *machineTestBuilder) {
 	if err != nil {
 		Fail(fmt.Sprintf("failed to create machine test: %q", err))
 	}
-	f, err := os.Open(fqImageName)
+	src, err := os.Open(fqImageName)
 	if err != nil {
 		Fail(fmt.Sprintf("failed to open file %s: %q", fqImageName, err))
 	}
+	defer func() {
+		if err := src.Close(); err != nil {
+			Fail(fmt.Sprintf("failed to close src reader %q: %q", src.Name(), err))
+		}
+	}()
 	mb.imagePath = filepath.Join(homeDir, suiteImageName)
-	n, err := os.Create(mb.imagePath)
+	dest, err := os.Create(mb.imagePath)
 	if err != nil {
 		Fail(fmt.Sprintf("failed to create file %s: %q", mb.imagePath, err))
 	}
-	if _, err := io.Copy(n, f); err != nil {
-		Fail(fmt.Sprintf("failed to copy %ss to %s: %q", fqImageName, mb.imagePath, err))
+	defer func() {
+		if err := dest.Close(); err != nil {
+			Fail(fmt.Sprintf("failed to close destination file %q: %q\n", dest.Name(), err))
+		}
+	}()
+	fmt.Printf("--> copying %q to %q\n", src.Name(), dest.Name())
+	if runtime.GOOS != "darwin" {
+		if _, err := io.Copy(dest, src); err != nil {
+			Fail(fmt.Sprintf("failed to copy %ss to %s: %q", fqImageName, mb.imagePath, err))
+		}
+	} else {
+		if err := copySparse(dest, src); err != nil {
+			Fail(fmt.Sprintf("failed to copy %q to %q: %q", src.Name(), dest.Name(), err))
+		}
 	}
 	return homeDir, mb
 }
 
 func teardown(origHomeDir string, testDir string, mb *machineTestBuilder) {
-	s := new(stopMachine)
+	r := new(rmMachine)
 	for _, name := range mb.names {
-		if _, err := mb.setName(name).setCmd(s).run(); err != nil {
-			fmt.Printf("error occurred rm'ing machine: %q\n", err)
+		if _, err := mb.setName(name).setCmd(r.withForce()).run(); err != nil {
+			GinkgoWriter.Printf("error occurred rm'ing machine: %q\n", err)
 		}
 	}
-	if err := os.RemoveAll(testDir); err != nil {
+
+	if err := utils.GuardedRemoveAll(testDir); err != nil {
 		Fail(fmt.Sprintf("failed to remove test dir: %q", err))
 	}
 	// this needs to be last in teardown
 	if err := os.Setenv("HOME", origHomeDir); err != nil {
 		Fail("failed to set home dir")
 	}
+	if runtime.GOOS == "windows" {
+		if err := os.Setenv("USERPROFILE", origHomeDir); err != nil {
+			Fail("failed to set windows home dir back to original")
+		}
+	}
+}
+
+// copySparse is a helper method for tests only; caller is responsible for closures
+func copySparse(dst io.WriteSeeker, src io.Reader) (retErr error) {
+	spWriter := compression.NewSparseWriter(dst)
+	defer func() {
+		if err := spWriter.Close(); err != nil && retErr == nil {
+			retErr = err
+		}
+	}()
+	_, err := io.Copy(spWriter, src)
+	return err
 }

@@ -1,9 +1,8 @@
 package copy
 
 import (
+	"fmt"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 // ParseSourceAndDestination parses the source and destination input into a
@@ -19,7 +18,7 @@ func ParseSourceAndDestination(source, destination string) (string, string, stri
 	destContainer, destPath := parseUserInput(destination)
 
 	if len(sourcePath) == 0 || len(destPath) == 0 {
-		return "", "", "", "", errors.Errorf("invalid arguments %q, %q: you must specify paths", source, destination)
+		return "", "", "", "", fmt.Errorf("invalid arguments %q, %q: you must specify paths", source, destination)
 	}
 
 	return sourceContainer, sourcePath, destContainer, destPath, nil
@@ -41,9 +40,9 @@ func parseUserInput(input string) (container string, path string) {
 		return
 	}
 
-	if spl := strings.SplitN(path, ":", 2); len(spl) == 2 {
-		container = spl[0]
-		path = spl[1]
+	if parsedContainer, parsedPath, ok := strings.Cut(path, ":"); ok {
+		container = parsedContainer
+		path = parsedPath
 	}
 	return
 }

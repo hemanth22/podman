@@ -1,3 +1,5 @@
+//go:build !remote
+
 package generate
 
 import (
@@ -8,18 +10,36 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/common/pkg/config"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/util"
+	"github.com/containers/storage/pkg/fileutils"
+
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 // DevicesFromPath computes a list of devices
 func DevicesFromPath(g *generate.Generator, devicePath string) error {
+	if isCDIDevice(devicePath) {
+		registry, err := cdi.NewCache(
+			cdi.WithAutoRefresh(false),
+		)
+		if err != nil {
+			return fmt.Errorf("creating CDI registry: %w", err)
+		}
+		if err := registry.Refresh(); err != nil {
+			logrus.Debugf("The following error was triggered when refreshing the CDI registry: %v", err)
+		}
+		if _, err := registry.InjectDevices(g.Config, devicePath); err != nil {
+			return fmt.Errorf("setting up CDI devices: %w", err)
+		}
+		return nil
+	}
 	devs := strings.Split(devicePath, ":")
 	resolvedDevicePath := devs[0]
 	// check if it is a symbolic link
@@ -46,7 +66,7 @@ func DevicesFromPath(g *generate.Generator, devicePath string) error {
 		}
 		if len(devs) > 2 {
 			if devmode != "" {
-				return errors.Wrapf(unix.EINVAL, "invalid device specification %s", devicePath)
+				return fmt.Errorf("invalid device specification %s: %w", devicePath, unix.EINVAL)
 			}
 			devmode = devs[2]
 		}
@@ -60,7 +80,7 @@ func DevicesFromPath(g *generate.Generator, devicePath string) error {
 					device = fmt.Sprintf("%s:%s", device, devmode)
 				}
 				if err := addDevice(g, device); err != nil {
-					return errors.Wrapf(err, "failed to add %s device", dpath)
+					return fmt.Errorf("failed to add %s device: %w", dpath, err)
 				}
 			}
 			return nil
@@ -68,7 +88,7 @@ func DevicesFromPath(g *generate.Generator, devicePath string) error {
 			return err
 		}
 		if !found {
-			return errors.Wrapf(unix.EINVAL, "no devices found in %s", devicePath)
+			return fmt.Errorf("no devices found in %s: %w", devicePath, unix.EINVAL)
 		}
 		return nil
 	}
@@ -76,34 +96,14 @@ func DevicesFromPath(g *generate.Generator, devicePath string) error {
 }
 
 func BlockAccessToKernelFilesystems(privileged, pidModeIsHost bool, mask, unmask []string, g *generate.Generator) {
-	defaultMaskPaths := []string{"/proc/acpi",
-		"/proc/kcore",
-		"/proc/keys",
-		"/proc/latency_stats",
-		"/proc/timer_list",
-		"/proc/timer_stats",
-		"/proc/sched_debug",
-		"/proc/scsi",
-		"/sys/firmware",
-		"/sys/fs/selinux",
-		"/sys/dev/block",
-	}
-
 	if !privileged {
-		for _, mp := range defaultMaskPaths {
+		for _, mp := range config.DefaultMaskedPaths {
 			// check that the path to mask is not in the list of paths to unmask
 			if shouldMask(mp, unmask) {
 				g.AddLinuxMaskedPaths(mp)
 			}
 		}
-		for _, rp := range []string{
-			"/proc/asound",
-			"/proc/bus",
-			"/proc/fs",
-			"/proc/irq",
-			"/proc/sys",
-			"/proc/sysrq-trigger",
-		} {
+		for _, rp := range config.DefaultReadOnlyPaths {
 			if shouldMask(rp, unmask) {
 				g.AddLinuxReadonlyPaths(rp)
 			}
@@ -131,10 +131,10 @@ func addDevice(g *generate.Generator, device string) error {
 	}
 	dev, err := util.DeviceFromPath(src)
 	if err != nil {
-		return errors.Wrapf(err, "%s is not a valid device", src)
+		return fmt.Errorf("%s is not a valid device: %w", src, err)
 	}
 	if rootless.IsRootless() {
-		if _, err := os.Stat(src); err != nil {
+		if err := fileutils.Exists(src); err != nil {
 			return err
 		}
 		perm := "ro"
@@ -161,61 +161,6 @@ func addDevice(g *generate.Generator, device string) error {
 	g.AddDevice(*dev)
 	g.AddLinuxResourcesDevice(true, dev.Type, &dev.Major, &dev.Minor, permissions)
 	return nil
-}
-
-// ParseDevice parses device mapping string to a src, dest & permissions string
-func ParseDevice(device string) (string, string, string, error) { //nolint
-	var src string
-	var dst string
-	permissions := "rwm"
-	arr := strings.Split(device, ":")
-	switch len(arr) {
-	case 3:
-		if !IsValidDeviceMode(arr[2]) {
-			return "", "", "", fmt.Errorf("invalid device mode: %s", arr[2])
-		}
-		permissions = arr[2]
-		fallthrough
-	case 2:
-		if IsValidDeviceMode(arr[1]) {
-			permissions = arr[1]
-		} else {
-			if arr[1][0] != '/' {
-				return "", "", "", fmt.Errorf("invalid device mode: %s", arr[1])
-			}
-			dst = arr[1]
-		}
-		fallthrough
-	case 1:
-		src = arr[0]
-	default:
-		return "", "", "", fmt.Errorf("invalid device specification: %s", device)
-	}
-
-	if dst == "" {
-		dst = src
-	}
-	return src, dst, permissions, nil
-}
-
-// IsValidDeviceMode checks if the mode for device is valid or not.
-// IsValid mode is a composition of r (read), w (write), and m (mknod).
-func IsValidDeviceMode(mode string) bool {
-	var legalDeviceMode = map[rune]bool{
-		'r': true,
-		'w': true,
-		'm': true,
-	}
-	if mode == "" {
-		return false
-	}
-	for _, c := range mode {
-		if !legalDeviceMode[c] {
-			return false
-		}
-		legalDeviceMode[c] = false
-	}
-	return true
 }
 
 func supportAmbientCapabilities() bool {

@@ -1,4 +1,4 @@
-% podman-cp(1)
+% podman-cp 1
 
 ## NAME
 podman\-cp - Copy files/folders between a container and the local filesystem
@@ -52,20 +52,20 @@ Using `-` as the **src_path** streams the contents of `STDIN` as a tar archive. 
 
 Note that `podman cp` ignores permission errors when copying from a running rootless container.  The TTY devices inside a rootless container are owned by the host's root user and hence cannot be read inside the container's user namespace.
 
-Further note that `podman cp` does not support globbing (e.g., `cp dir/*.txt`).  If you want to copy multiple files from the host to the container you may use xargs(1) or find(1) (or similar tools for chaining commands) in conjunction with `podman cp`.  If you want to copy multiple files from the container to the host, you may use `podman mount CONTAINER` and operate on the returned mount point instead (see ALTERNATIVES below).
+Further note that `podman cp` does not support globbing (e.g., `cp dir/*.txt`).  To copy multiple files from the host to the container use xargs(1) or find(1) (or similar tools for chaining commands) in conjunction with `podman cp`.  To copy multiple files from the container to the host, use `podman mount CONTAINER` and operate on the returned mount point instead (see ALTERNATIVES below).
 
 ## OPTIONS
 
 #### **--archive**, **-a**
 
-Archive mode (copy all uid/gid information).
-When set to true, files copied to a container will have changed ownership to the primary UID/GID of the container.
-When set to false, maintain uid/gid from archive sources instead of changing them to the primary uid/gid of the destination container.
+Archive mode (copy all UID/GID information).
+When set to true, files copied to a container have changed ownership to the primary UID/GID of the container.
+When set to false, maintain UID/GID from archive sources instead of changing them to the primary UID/GID of the destination container.
 The default is **true**.
 
 #### **--overwrite**
 
-Allow directories to be overwritten with non-directories and vice versa.  By default, `podman cp` errors out when attempting to overwrite, for instance, a regular file with a directory.  Use this option, if you want to allow this behavior.
+Allow directories to be overwritten with non-directories and vice versa.  By default, `podman cp` errors out when attempting to overwrite, for instance, a regular file with a directory.
 
 ## ALTERNATIVES
 
@@ -101,35 +101,35 @@ the cp command.
 
 ## EXAMPLES
 
-- Copy a file from host to a container.
-  ```
-  podman cp /myapp/app.conf containerID:/myapp/app.conf
-  ```
+Copy a file from the host to a container:
+```
+podman cp /myapp/app.conf containerID:/myapp/app.conf
+```
 
-- Copy a file from a container to a directory on another container.
-  ```
-  podman cp containerID1:/myfile.txt containerID2:/tmp
-  ```
+Copy a file from a container to a directory on another container:
+```
+podman cp containerID1:/myfile.txt containerID2:/tmp
+```
 
-- Copy a directory on a container to a directory on the host.
-  ```
-  podman cp containerID:/myapp/ /myapp/
-  ```
+Copy a directory on a container to a directory on the host:
+```
+podman cp containerID:/myapp/ /myapp/
+```
 
-- Copy the contents of a directory on a container to a directory on the host.
-  ```
-  podman cp containerID:/home/myuser/. /home/myuser/
-  ```
+Copy the contents of a directory on a container to a directory on the host:
+```
+podman cp containerID:/home/myuser/. /home/myuser/
+```
 
-- Copy a directory on a container into a directory on another.
-  ```
-  podman cp containerA:/myapp containerB:/yourapp
-  ```
+Copy a directory on a container into a directory on another:
+```
+podman cp containerA:/myapp containerB:/newapp
+```
 
-- Stream a tar archive from `STDIN` to a container.
-  ```
-  podman cp - containerID:/myfiles.tar.gz < myfiles.tar.gz
-  ```
+Stream a tar archive from `STDIN` to a container:
+```
+podman cp - containerID:/myfiles.tar.gz < myfiles.tar.gz
+```
 
 ## SEE ALSO
 **[podman(1)](podman.1.md)**, **[podman-mount(1)](podman-mount.1.md)**, **[podman-unmount(1)](podman-unmount.1.md)**

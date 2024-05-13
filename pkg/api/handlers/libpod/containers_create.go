@@ -1,19 +1,20 @@
 package libpod
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/specgen"
-	"github.com/containers/podman/v4/pkg/specgen/generate"
-	"github.com/containers/podman/v4/pkg/specgenutil"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/specgen/generate"
+	"github.com/containers/podman/v5/pkg/specgenutil"
+	"github.com/containers/storage"
 )
 
 // CreateContainer takes a specgenerator and makes a container. It returns
@@ -29,12 +30,16 @@ func CreateContainer(w http.ResponseWriter, r *http.Request) {
 	// we have to set the default before we decode to make sure the correct default is set when the field is unset
 	sg := specgen.SpecGenerator{
 		ContainerNetworkConfig: specgen.ContainerNetworkConfig{
-			UseImageHosts: conf.Containers.NoHosts,
+			UseImageHosts: &conf.Containers.NoHosts,
+		},
+		ContainerSecurityConfig: specgen.ContainerSecurityConfig{
+			Umask:      conf.Containers.Umask,
+			Privileged: &conf.Containers.Privileged,
 		},
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&sg); err != nil {
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "Decode()"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("decode(): %w", err))
 		return
 	}
 	if sg.Passwd == nil {
@@ -57,15 +62,24 @@ func CreateContainer(w http.ResponseWriter, r *http.Request) {
 
 	warn, err := generate.CompleteSpec(r.Context(), runtime, &sg)
 	if err != nil {
+		if errors.Is(err, storage.ErrImageUnknown) {
+			utils.Error(w, http.StatusNotFound, fmt.Errorf("no such image: %w", err))
+			return
+		}
 		utils.InternalServerError(w, err)
 		return
 	}
-	rtSpec, spec, opts, err := generate.MakeContainer(context.Background(), runtime, &sg, false, nil)
+
+	rtSpec, spec, opts, err := generate.MakeContainer(r.Context(), runtime, &sg, false, nil)
 	if err != nil {
+		if errors.Is(err, storage.ErrImageUnknown) {
+			utils.Error(w, http.StatusNotFound, fmt.Errorf("no such image: %w", err))
+			return
+		}
 		utils.InternalServerError(w, err)
 		return
 	}
-	ctr, err := generate.ExecuteCreate(context.Background(), runtime, rtSpec, spec, false, opts...)
+	ctr, err := generate.ExecuteCreate(r.Context(), runtime, rtSpec, spec, false, opts...)
 	if err != nil {
 		utils.InternalServerError(w, err)
 		return

@@ -5,20 +5,18 @@ import (
 	"net/http"
 
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/auth"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/auth"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
 	"github.com/containers/storage"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
 )
 
 func SearchImages(w http.ResponseWriter, r *http.Request) {
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 	query := struct {
 		Term      string              `json:"term"`
 		Limit     int                 `json:"limit"`
@@ -27,19 +25,27 @@ func SearchImages(w http.ResponseWriter, r *http.Request) {
 		ListTags  bool                `json:"listTags"`
 	}{
 		// This is where you can override the golang default value for one of fields
+		TLSVerify: true,
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusBadRequest, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
-	_, authfile, err := auth.GetCredentials(r)
+	authconf, authfile, err := auth.GetCredentials(r)
 	if err != nil {
 		utils.Error(w, http.StatusBadRequest, err)
 		return
 	}
 	defer auth.RemoveAuthfile(authfile)
+
+	var username, password, idToken string
+	if authconf != nil {
+		username = authconf.Username
+		password = authconf.Password
+		idToken = authconf.IdentityToken
+	}
 
 	filters := []string{}
 	for key, val := range query.Filters {
@@ -47,10 +53,13 @@ func SearchImages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	options := entities.ImageSearchOptions{
-		Authfile: authfile,
-		Limit:    query.Limit,
-		ListTags: query.ListTags,
-		Filters:  filters,
+		Authfile:      authfile,
+		Limit:         query.Limit,
+		ListTags:      query.ListTags,
+		Password:      password,
+		Username:      username,
+		IdentityToken: idToken,
+		Filters:       filters,
 	}
 	if _, found := r.URL.Query()["tlsVerify"]; found {
 		options.SkipTLSVerify = types.NewOptionalBool(!query.TLSVerify)

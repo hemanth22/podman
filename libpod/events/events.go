@@ -2,16 +2,16 @@ package events
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/containers/storage/pkg/stringid"
-	"github.com/pkg/errors"
 )
 
 // ErrNoJournaldLogging indicates that there is no journald logging
 // supported (requires libsystemd)
-var ErrNoJournaldLogging = errors.New("No support for journald logging")
+var ErrNoJournaldLogging = errors.New("no support for journald logging")
 
 // String returns a string representation of EventerType
 func (et EventerType) String() string {
@@ -54,13 +54,6 @@ func NewEvent(status Status) Event {
 	}
 }
 
-// Recycle checks if the event log has reach a limit and if so
-// renames the current log and starts a new one.  The remove bool
-// indicates the old log file should be deleted.
-func (e *Event) Recycle(path string, remove bool) error {
-	return errors.New("not implemented")
-}
-
 // ToJSONString returns the event as a json'ified string
 func (e *Event) ToJSONString() (string, error) {
 	b, err := json.Marshal(e)
@@ -69,6 +62,9 @@ func (e *Event) ToJSONString() (string, error) {
 
 // ToHumanReadable returns human-readable event as a formatted string
 func (e *Event) ToHumanReadable(truncate bool) string {
+	if e == nil {
+		return ""
+	}
 	var humanFormat string
 	id := e.ID
 	if truncate {
@@ -77,6 +73,12 @@ func (e *Event) ToHumanReadable(truncate bool) string {
 	switch e.Type {
 	case Container, Pod:
 		humanFormat = fmt.Sprintf("%s %s %s %s (image=%s, name=%s", e.Time, e.Type, e.Status, id, e.Image, e.Name)
+		if e.PodID != "" {
+			humanFormat += fmt.Sprintf(", pod_id=%s", e.PodID)
+		}
+		if e.HealthStatus != "" {
+			humanFormat += fmt.Sprintf(", health_status=%s", e.HealthStatus)
+		}
 		// check if the container has labels and add it to the output
 		if len(e.Attributes) > 0 {
 			for k, v := range e.Attributes {
@@ -88,6 +90,9 @@ func (e *Event) ToHumanReadable(truncate bool) string {
 		humanFormat = fmt.Sprintf("%s %s %s %s (container=%s, name=%s)", e.Time, e.Type, e.Status, id, id, e.Network)
 	case Image:
 		humanFormat = fmt.Sprintf("%s %s %s %s %s", e.Time, e.Type, e.Status, id, e.Name)
+		if e.Error != "" {
+			humanFormat += " " + e.Error
+		}
 	case System:
 		if e.Name != "" {
 			humanFormat = fmt.Sprintf("%s %s %s %s", e.Time, e.Type, e.Status, e.Name)
@@ -100,7 +105,7 @@ func (e *Event) ToHumanReadable(truncate bool) string {
 	return humanFormat
 }
 
-// NewEventFromString takes stringified json and converts
+// newEventFromJSONString takes stringified json and converts
 // it to an event
 func newEventFromJSONString(event string) (*Event, error) {
 	e := new(Event)
@@ -140,7 +145,7 @@ func StringToType(name string) (Type, error) {
 	case "":
 		return "", ErrEventTypeBlank
 	}
-	return "", errors.Errorf("unknown event type %q", name)
+	return "", fmt.Errorf("unknown event type %q", name)
 }
 
 // StringToStatus converts a string to an Event Status
@@ -168,6 +173,8 @@ func StringToStatus(name string) (Status, error) {
 		return Exited, nil
 	case Export.String():
 		return Export, nil
+	case HealthStatus.String():
+		return HealthStatus, nil
 	case History.String():
 		return History, nil
 	case Import.String():
@@ -190,6 +197,8 @@ func StringToStatus(name string) (Status, error) {
 		return Prune, nil
 	case Pull.String():
 		return Pull, nil
+	case PullError.String():
+		return PullError, nil
 	case Push.String():
 		return Push, nil
 	case Refresh.String():
@@ -222,6 +231,8 @@ func StringToStatus(name string) (Status, error) {
 		return Unpause, nil
 	case Untag.String():
 		return Untag, nil
+	case Update.String():
+		return Update, nil
 	}
-	return "", errors.Errorf("unknown event status %q", name)
+	return "", fmt.Errorf("unknown event status %q", name)
 }

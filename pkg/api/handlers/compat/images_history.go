@@ -1,13 +1,13 @@
 package compat
 
 import (
+	"fmt"
 	"net/http"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/api/handlers"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
 )
 
 func HistoryImage(w http.ResponseWriter, r *http.Request) {
@@ -16,13 +16,13 @@ func HistoryImage(w http.ResponseWriter, r *http.Request) {
 
 	possiblyNormalizedName, err := utils.NormalizeToDockerHub(r, name)
 	if err != nil {
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "error normalizing image"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("normalizing image: %w", err))
 		return
 	}
 
 	newImage, _, err := runtime.LibimageRuntime().LookupImage(possiblyNormalizedName, nil)
 	if err != nil {
-		utils.ImageNotFound(w, possiblyNormalizedName, errors.Wrapf(err, "failed to find image %s", possiblyNormalizedName))
+		utils.ImageNotFound(w, possiblyNormalizedName, fmt.Errorf("failed to find image %s: %w", possiblyNormalizedName, err))
 		return
 	}
 	history, err := newImage.History(r.Context())
@@ -33,12 +33,16 @@ func HistoryImage(w http.ResponseWriter, r *http.Request) {
 	allHistory := make([]handlers.HistoryResponse, 0, len(history))
 	for _, h := range history {
 		l := handlers.HistoryResponse{
-			ID:        h.ID,
 			Created:   h.Created.Unix(),
 			CreatedBy: h.CreatedBy,
 			Tags:      h.Tags,
 			Size:      h.Size,
 			Comment:   h.Comment,
+		}
+		if utils.IsLibpodRequest(r) {
+			l.ID = h.ID
+		} else {
+			l.ID = "sha256:" + h.ID
 		}
 		allHistory = append(allHistory, l)
 	}

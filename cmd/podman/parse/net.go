@@ -1,4 +1,3 @@
-// nolint
 // most of these validate and parse functions have been taken from projectatomic/docker
 // and modified for cri-o
 package parse
@@ -9,53 +8,40 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/containers/common/libnetwork/etchosts"
+	"github.com/containers/storage/pkg/regexp"
 )
 
 const (
-	Protocol_TCP Protocol = 0
-	Protocol_UDP Protocol = 1
-	LabelType    string   = "label"
-	ENVType      string   = "env"
+	LabelType string = "label"
+	ENVType   string = "env"
 )
-
-type Protocol int32
-
-// PortMapping specifies the port mapping configurations of a sandbox.
-type PortMapping struct {
-	// Protocol of the port mapping.
-	Protocol Protocol `protobuf:"varint,1,opt,name=protocol,proto3,enum=runtime.Protocol" json:"protocol,omitempty"`
-	// Port number within the container. Default: 0 (not specified).
-	ContainerPort int32 `protobuf:"varint,2,opt,name=container_port,json=containerPort,proto3" json:"container_port,omitempty"`
-	// Port number on the host. Default: 0 (not specified).
-	HostPort int32 `protobuf:"varint,3,opt,name=host_port,json=hostPort,proto3" json:"host_port,omitempty"`
-	// Host IP.
-	HostIp string `protobuf:"bytes,4,opt,name=host_ip,json=hostIp,proto3" json:"host_ip,omitempty"`
-}
 
 // Note: for flags that are in the form <number><unit>, use the RAMInBytes function
 // from the units package in docker/go-units/size.go
 
 var (
 	whiteSpaces  = " \t"
-	alphaRegexp  = regexp.MustCompile(`[a-zA-Z]`)
-	domainRegexp = regexp.MustCompile(`^(:?(:?[a-zA-Z0-9]|(:?[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]))(:?\.(:?[a-zA-Z0-9]|(:?[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])))*)\.?\s*$`)
+	alphaRegexp  = regexp.Delayed(`[a-zA-Z]`)
+	domainRegexp = regexp.Delayed(`^(:?(:?[a-zA-Z0-9]|(:?[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]))(:?\.(:?[a-zA-Z0-9]|(:?[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])))*)\.?\s*$`)
 )
 
 // validateExtraHost validates that the specified string is a valid extrahost and returns it.
-// ExtraHost is in the form of name:ip where the ip has to be a valid ip (ipv4 or ipv6).
+// ExtraHost is in the form of name:ip where the ip has to be a valid ip (ipv4 or ipv6) or the special string HostGateway.
 // for add-host flag
-func ValidateExtraHost(val string) (string, error) { // nolint
+func ValidateExtraHost(val string) (string, error) {
 	// allow for IPv6 addresses in extra hosts by only splitting on first ":"
-	arr := strings.SplitN(val, ":", 2)
-	if len(arr) != 2 || len(arr[0]) == 0 {
+	name, ip, hasIP := strings.Cut(val, ":")
+	if !hasIP || len(name) == 0 {
 		return "", fmt.Errorf("bad format for add-host: %q", val)
 	}
-	if _, err := validateIPAddress(arr[1]); err != nil {
-		return "", fmt.Errorf("invalid IP address in add-host: %q", arr[1])
+	if ip == etchosts.HostGateway {
+		return val, nil
+	}
+	if _, err := validateIPAddress(ip); err != nil {
+		return "", fmt.Errorf("invalid IP address in add-host: %q", ip)
 	}
 	return val, nil
 }
@@ -96,45 +82,37 @@ func GetAllLabels(labelFile, inputLabels []string) (map[string]string, error) {
 		}
 	}
 	for _, label := range inputLabels {
-		split := strings.SplitN(label, "=", 2)
-		if split[0] == "" {
-			return nil, errors.Errorf("invalid label format: %q", label)
+		key, value, _ := strings.Cut(label, "=")
+		if key == "" {
+			return nil, fmt.Errorf("invalid label format: %q", label)
 		}
-		value := ""
-		if len(split) > 1 {
-			value = split[1]
-		}
-		labels[split[0]] = value
+		labels[key] = value
 	}
 	return labels, nil
 }
 
 func parseEnvOrLabel(env map[string]string, line, configType string) error {
-	data := strings.SplitN(line, "=", 2)
+	key, val, hasVal := strings.Cut(line, "=")
 
 	// catch invalid variables such as "=" or "=A"
-	if data[0] == "" {
-		return errors.Errorf("invalid environment variable: %q", line)
+	if key == "" {
+		return fmt.Errorf("invalid environment variable: %q", line)
 	}
 
 	// trim the front of a variable, but nothing else
-	name := strings.TrimLeft(data[0], whiteSpaces)
+	name := strings.TrimLeft(key, whiteSpaces)
 	if strings.ContainsAny(name, whiteSpaces) {
-		return errors.Errorf("name %q has white spaces, poorly formatted name", name)
+		return fmt.Errorf("name %q has white spaces, poorly formatted name", name)
 	}
 
-	if len(data) > 1 {
-		env[name] = data[1]
+	if hasVal {
+		env[name] = val
 	} else {
-		if strings.HasSuffix(name, "*") {
-			name = strings.TrimSuffix(name, "*")
+		if name, hasStar := strings.CutSuffix(name, "*"); hasStar {
 			for _, e := range os.Environ() {
-				part := strings.SplitN(e, "=", 2)
-				if len(part) < 2 {
-					continue
-				}
-				if strings.HasPrefix(part[0], name) {
-					env[part[0]] = part[1]
+				envKey, envVal, hasEq := strings.Cut(e, "=")
+				if hasEq && strings.HasPrefix(envKey, name) {
+					env[envKey] = envVal
 				}
 			}
 		} else if configType == ENVType {
@@ -170,23 +148,14 @@ func parseEnvOrLabelFile(envOrLabel map[string]string, filename, configType stri
 	return scanner.Err()
 }
 
-// ValidateFileName returns an error if filename contains ":"
-// as it is currently not supported
-func ValidateFileName(filename string) error {
-	if strings.Contains(filename, ":") {
-		return errors.Errorf("invalid filename (should not contain ':') %q", filename)
-	}
-	return nil
-}
-
 // ValidURL checks a string urlStr is a url or not
 func ValidURL(urlStr string) error {
 	url, err := url.ParseRequestURI(urlStr)
 	if err != nil {
-		return errors.Wrapf(err, "invalid url %q", urlStr)
+		return fmt.Errorf("invalid url %q: %w", urlStr, err)
 	}
 	if url.Scheme == "" {
-		return errors.Errorf("invalid url %q: missing scheme", urlStr)
+		return fmt.Errorf("invalid url %q: missing scheme", urlStr)
 	}
 	return nil
 }

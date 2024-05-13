@@ -2,18 +2,19 @@ package pods
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/containers/common/pkg/completion"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/cmd/podman/validate"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/specgenutil"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/specgenutil"
 	"github.com/spf13/cobra"
 )
 
@@ -42,7 +43,7 @@ var (
   podman pod rm -f 860a4b23
   podman pod rm -f -a`,
 	}
-	stopTimeout uint
+	stopTimeout int
 )
 
 func init() {
@@ -61,7 +62,7 @@ func init() {
 	_ = rmCommand.RegisterFlagCompletionFunc(podIDFileFlagName, completion.AutocompleteDefault)
 
 	timeFlagName := "time"
-	flags.UintVarP(&stopTimeout, timeFlagName, "t", containerConfig.Engine.StopTimeout, "Seconds to wait for pod stop before killing the container")
+	flags.IntVarP(&stopTimeout, timeFlagName, "t", int(containerConfig.Engine.StopTimeout), "Seconds to wait for pod stop before killing the container")
 	_ = rmCommand.RegisterFlagCompletionFunc(timeFlagName, completion.AutocompleteNone)
 
 	validate.AddLatestFlag(rmCommand, &rmOptions.Latest)
@@ -72,29 +73,52 @@ func init() {
 }
 
 func rm(cmd *cobra.Command, args []string) error {
-	ids, err := specgenutil.ReadPodIDFiles(rmOptions.PodIDFiles)
-	if err != nil {
-		return err
-	}
-	args = append(args, ids...)
+	var errs utils.OutputErrors
+
 	if cmd.Flag("time").Changed {
 		if !rmOptions.Force {
 			return errors.New("--force option must be specified to use the --time option")
 		}
-		rmOptions.Timeout = &stopTimeout
+		timeout := uint(stopTimeout)
+		rmOptions.Timeout = &timeout
 	}
-	return removePods(args, rmOptions.PodRmOptions, true)
+
+	if rmOptions.Force {
+		rmOptions.Ignore = true
+	}
+
+	errs = append(errs, removePods(args, rmOptions.PodRmOptions, true)...)
+
+	for _, idFile := range rmOptions.PodIDFiles {
+		id, err := specgenutil.ReadPodIDFile(idFile)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		rmErrs := removePods([]string{id}, rmOptions.PodRmOptions, true)
+		errs = append(errs, rmErrs...)
+		if len(rmErrs) == 0 {
+			if err := os.Remove(idFile); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	return errs.PrintErrors()
 }
 
 // removePods removes the specified pods (names or IDs).  Allows for sharing
 // pod-removal logic across commands.
-func removePods(namesOrIDs []string, rmOptions entities.PodRmOptions, printIDs bool) error {
+func removePods(namesOrIDs []string, rmOptions entities.PodRmOptions, printIDs bool) utils.OutputErrors {
 	var errs utils.OutputErrors
 
 	responses, err := registry.ContainerEngine().PodRm(context.Background(), namesOrIDs, rmOptions)
 	if err != nil {
 		setExitCode(err)
-		return err
+		errs = append(errs, err)
+		if !strings.Contains(err.Error(), define.ErrRemovingCtrs.Error()) {
+			return errs
+		}
 	}
 
 	// in the cli, first we print out all the successful attempts
@@ -106,17 +130,18 @@ func removePods(namesOrIDs []string, rmOptions entities.PodRmOptions, printIDs b
 		} else {
 			setExitCode(r.Err)
 			errs = append(errs, r.Err)
+			for ctr, err := range r.RemovedCtrs {
+				if err != nil {
+					errs = append(errs, fmt.Errorf("error removing container %s from pod %s: %w", ctr, r.Id, err))
+				}
+			}
 		}
 	}
-	return errs.PrintErrors()
+	return errs
 }
 
 func setExitCode(err error) {
-	cause := errors.Cause(err)
-	switch {
-	case cause == define.ErrNoSuchPod:
-		registry.SetExitCode(1)
-	case strings.Contains(cause.Error(), define.ErrNoSuchPod.Error()):
+	if errors.Is(err, define.ErrNoSuchPod) || strings.Contains(err.Error(), define.ErrNoSuchPod.Error()) {
 		registry.SetExitCode(1)
 	}
 }

@@ -1,6 +1,7 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -11,11 +12,10 @@ import (
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/common/pkg/report"
 	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -89,7 +89,7 @@ func imageListFlagSet(cmd *cobra.Command) {
 	flags.BoolVarP(&listOptions.All, "all", "a", false, "Show all images (default hides intermediate images)")
 
 	filterFlagName := "filter"
-	flags.StringSliceVarP(&listOptions.Filter, filterFlagName, "f", []string{}, "Filter output based on conditions provided (default [])")
+	flags.StringArrayVarP(&listOptions.Filter, filterFlagName, "f", []string{}, "Filter output based on conditions provided (default [])")
 	_ = cmd.RegisterFlagCompletionFunc(filterFlagName, common.AutocompleteImageFilters)
 
 	formatFlagName := "format"
@@ -225,7 +225,7 @@ func sortImages(imageS []*entities.ImageSummary) ([]imageReporter, error) {
 				h.ImageSummary = *e
 				h.Repository, h.Tag, err = tokenRepoTag(tag)
 				if err != nil {
-					return nil, errors.Wrapf(err, "error parsing repository tag: %q", tag)
+					return nil, fmt.Errorf("parsing repository tag: %q: %w", tag, err)
 				}
 				if h.Tag == "<none>" {
 					untagged = append(untagged, h)

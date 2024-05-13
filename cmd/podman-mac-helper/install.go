@@ -1,10 +1,10 @@
 //go:build darwin
-// +build darwin
 
 package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,13 +14,13 @@ import (
 	"syscall"
 	"text/template"
 
-	"github.com/pkg/errors"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/spf13/cobra"
 )
 
 const (
-	rwx_rx_rx = 0755
-	rw_r_r    = 0644
+	mode755 = 0755
+	mode644 = 0644
 )
 
 const launchConfig = `<?xml version="1.0" encoding="UTF-8"?>
@@ -72,8 +72,8 @@ type launchParams struct {
 
 var installCmd = &cobra.Command{
 	Use:    "install",
-	Short:  "installs the podman helper agent",
-	Long:   "installs the podman helper agent, which manages the /var/run/docker.sock link",
+	Short:  "Install the podman helper agent",
+	Long:   "Install the podman helper agent, which manages the /var/run/docker.sock link",
 	PreRun: silentUsage,
 	RunE:   install,
 }
@@ -92,8 +92,9 @@ func install(cmd *cobra.Command, args []string) error {
 	labelName := fmt.Sprintf("com.github.containers.podman.helper-%s.plist", userName)
 	fileName := filepath.Join("/Library", "LaunchDaemons", labelName)
 
-	if _, err := os.Stat(fileName); err == nil || !os.IsNotExist(err) {
-		return errors.New("helper is already installed, uninstall first")
+	if err := fileutils.Exists(fileName); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		fmt.Fprintln(os.Stderr, "helper is already installed, skipping the install, uninstall first if you want to reinstall")
+		return nil
 	}
 
 	prog, err := installExecutable(userName)
@@ -109,9 +110,9 @@ func install(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	file, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, rw_r_r)
+	file, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode644)
 	if err != nil {
-		return errors.Wrap(err, "error creating helper plist file")
+		return fmt.Errorf("creating helper plist file: %w", err)
 	}
 	defer file.Close()
 	_, err = buf.WriteTo(file)
@@ -120,7 +121,7 @@ func install(cmd *cobra.Command, args []string) error {
 	}
 
 	if err = runDetectErr("launchctl", "load", fileName); err != nil {
-		return errors.Wrap(err, "launchctl failed loading service")
+		return fmt.Errorf("launchctl failed loading service: %w", err)
 	}
 
 	return nil
@@ -133,13 +134,13 @@ func restrictRecursive(targetDir string, until string) error {
 			return err
 		}
 		if info.Mode()&fs.ModeSymlink != 0 {
-			return errors.Errorf("symlinks not allowed in helper paths (remove them and rerun): %s", targetDir)
+			return fmt.Errorf("symlinks not allowed in helper paths (remove them and rerun): %s", targetDir)
 		}
 		if err = os.Chown(targetDir, 0, 0); err != nil {
-			return errors.Wrap(err, "could not update ownership of helper path")
+			return fmt.Errorf("could not update ownership of helper path: %w", err)
 		}
-		if err = os.Chmod(targetDir, rwx_rx_rx|fs.ModeSticky); err != nil {
-			return errors.Wrap(err, "could not update permissions of helper path")
+		if err = os.Chmod(targetDir, mode755|fs.ModeSticky); err != nil {
+			return fmt.Errorf("could not update permissions of helper path: %w", err)
 		}
 		targetDir = filepath.Dir(targetDir)
 	}
@@ -162,7 +163,7 @@ func verifyRootDeep(path string) error {
 
 		stat := info.Sys().(*syscall.Stat_t)
 		if stat.Uid != 0 {
-			return errors.Errorf("installation target path must be solely owned by root: %s is not", current)
+			return fmt.Errorf("installation target path must be solely owned by root: %s is not", current)
 		}
 
 		if info.Mode()&fs.ModeSymlink != 0 {
@@ -193,7 +194,7 @@ func verifyRootDeep(path string) error {
 
 func installExecutable(user string) (string, error) {
 	// Since the installed executable runs as root, as a precaution verify root ownership of
-	// the entire installation path, and utilize sticky + read only perms for the helper path
+	// the entire installation path, and utilize sticky + read-only perms for the helper path
 	// suffix. The goal is to help users harden against privilege escalation from loose
 	// filesystem permissions.
 	//
@@ -205,8 +206,8 @@ func installExecutable(user string) (string, error) {
 	}
 
 	targetDir := filepath.Join(installPrefix, "podman", "helper", user)
-	if err := os.MkdirAll(targetDir, rwx_rx_rx); err != nil {
-		return "", errors.Wrap(err, "could not create helper directory structure")
+	if err := os.MkdirAll(targetDir, mode755); err != nil {
+		return "", fmt.Errorf("could not create helper directory structure: %w", err)
 	}
 
 	// Correct any incorrect perms on previously existing directories and verify no symlinks
@@ -220,7 +221,7 @@ func installExecutable(user string) (string, error) {
 	}
 	install := filepath.Join(targetDir, filepath.Base(exec))
 
-	return install, copyFile(install, exec, rwx_rx_rx)
+	return install, copyFile(install, exec, mode755)
 }
 
 func copyFile(dest string, source string, perms fs.FileMode) error {

@@ -1,19 +1,17 @@
 //go:build darwin
-// +build darwin
 
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -54,6 +52,7 @@ func main() {
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err.Error())
+		os.Exit(1)
 	}
 }
 
@@ -73,7 +72,7 @@ func getUserInfo(name string) (string, string, string, error) {
 	entry := readCapped(output)
 	elements := strings.Split(entry, ":")
 	if len(elements) < 9 || elements[0] != name {
-		return "", "", "", errors.New("Could not lookup user")
+		return "", "", "", errors.New("could not look up user")
 	}
 
 	return elements[0], elements[2], elements[8], nil
@@ -90,14 +89,14 @@ func getUser() (string, string, string, error) {
 
 	_, uid, home, err := getUserInfo(name)
 	if err != nil {
-		return "", "", "", fmt.Errorf("could not lookup user: %s", name)
+		return "", "", "", fmt.Errorf("could not look up user: %s", name)
 	}
 	id, err := strconv.Atoi(uid)
 	if err != nil {
 		return "", "", "", fmt.Errorf("invalid uid for user: %s", name)
 	}
 	if id == 0 {
-		return "", "", "", fmt.Errorf("unexpected root user")
+		return "", "", "", errors.New("unexpected root user")
 	}
 
 	return name, uid, home, nil
@@ -131,7 +130,7 @@ func readCapped(reader io.Reader) string {
 	// Cap output
 	buffer := make([]byte, 2048)
 	n, _ := io.ReadFull(reader, buffer)
-	_, _ = io.Copy(ioutil.Discard, reader)
+	_, _ = io.Copy(io.Discard, reader)
 	if n > 0 {
 		return string(buffer[:n])
 	}

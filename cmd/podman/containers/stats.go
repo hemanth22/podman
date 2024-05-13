@@ -1,20 +1,21 @@
 package containers
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	tm "github.com/buger/goterm"
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/common/pkg/report"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/validate"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/utils"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	putils "github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -58,6 +59,7 @@ type statsOptionsCLI struct {
 
 var (
 	statsOptions statsOptionsCLI
+	notrunc      bool
 )
 
 func statFlags(cmd *cobra.Command) {
@@ -69,6 +71,7 @@ func statFlags(cmd *cobra.Command) {
 	flags.StringVar(&statsOptions.Format, formatFlagName, "", "Pretty-print container statistics to JSON or using a Go template")
 	_ = cmd.RegisterFlagCompletionFunc(formatFlagName, common.AutocompleteFormat(&containerStats{}))
 
+	flags.BoolVar(&notrunc, "no-trunc", false, "Do not truncate output")
 	flags.BoolVar(&statsOptions.NoReset, "no-reset", false, "Disable resetting the screen between intervals")
 	flags.BoolVar(&statsOptions.NoStream, "no-stream", false, "Disable streaming stats and only pull the first result, default setting is false")
 	intervalFlagName := "interval"
@@ -105,7 +108,7 @@ func checkStatOptions(cmd *cobra.Command, args []string) error {
 		opts++
 	}
 	if opts > 1 {
-		return errors.Errorf("--all, --latest and containers cannot be used together")
+		return errors.New("--all, --latest and containers cannot be used together")
 	}
 	return nil
 }
@@ -117,7 +120,9 @@ func stats(cmd *cobra.Command, args []string) error {
 		Latest:   statsOptions.Latest,
 		Stream:   !statsOptions.NoStream,
 		Interval: statsOptions.Interval,
+		All:      statsOptions.All,
 	}
+	args = putils.RemoveSlash(args)
 	statsChan, err := registry.ContainerEngine().ContainerStats(registry.Context(), args, opts)
 	if err != nil {
 		return err
@@ -186,6 +191,9 @@ type containerStats struct {
 }
 
 func (s *containerStats) ID() string {
+	if notrunc {
+		return s.ContainerID
+	}
 	return s.ContainerID[0:12]
 }
 
@@ -198,7 +206,7 @@ func (s *containerStats) AVGCPU() string {
 }
 
 func (s *containerStats) Up() string {
-	return (s.UpTime.String())
+	return s.UpTime.String()
 }
 
 func (s *containerStats) MemPerc() string {
@@ -206,7 +214,15 @@ func (s *containerStats) MemPerc() string {
 }
 
 func (s *containerStats) NetIO() string {
-	return combineHumanValues(s.NetInput, s.NetOutput)
+	var netInput uint64
+	var netOutput uint64
+
+	for _, net := range s.Network {
+		netInput += net.RxBytes
+		netOutput += net.TxBytes
+	}
+
+	return combineHumanValues(netInput, netOutput)
 }
 
 func (s *containerStats) BlockIO() string {
@@ -214,11 +230,7 @@ func (s *containerStats) BlockIO() string {
 }
 
 func (s *containerStats) PIDS() string {
-	if s.PIDs == 0 {
-		// If things go bazinga, return a safe value
-		return "--"
-	}
-	return fmt.Sprintf("%d", s.PIDs)
+	return strconv.FormatUint(s.PIDs, 10)
 }
 
 func (s *containerStats) MemUsage() string {
@@ -230,34 +242,23 @@ func (s *containerStats) MemUsageBytes() string {
 }
 
 func floatToPercentString(f float64) string {
-	strippedFloat, err := utils.RemoveScientificNotationFromFloat(f)
-	if err != nil || strippedFloat == 0 {
-		// If things go bazinga, return a safe value
-		return "--"
-	}
-	return fmt.Sprintf("%.2f", strippedFloat) + "%"
+	return fmt.Sprintf("%.2f%%", f)
 }
 
 func combineHumanValues(a, b uint64) string {
-	if a == 0 && b == 0 {
-		return "-- / --"
-	}
 	return fmt.Sprintf("%s / %s", units.HumanSize(float64(a)), units.HumanSize(float64(b)))
 }
 
 func combineBytesValues(a, b uint64) string {
-	if a == 0 && b == 0 {
-		return "-- / --"
-	}
 	return fmt.Sprintf("%s / %s", units.BytesSize(float64(a)), units.BytesSize(float64(b)))
 }
 
 func outputJSON(stats []containerStats) error {
 	type jstat struct {
-		Id         string `json:"id"` // nolint
+		Id         string `json:"id"` //nolint:revive,stylecheck
 		Name       string `json:"name"`
 		CPUTime    string `json:"cpu_time"`
-		CpuPercent string `json:"cpu_percent"` // nolint
+		CpuPercent string `json:"cpu_percent"` //nolint:revive,stylecheck
 		AverageCPU string `json:"avg_cpu"`
 		MemUsage   string `json:"mem_usage"`
 		MemPerc    string `json:"mem_percent"`

@@ -1,9 +1,12 @@
+//go:build !remote
+
 package libpod
 
 import (
-	"github.com/containers/podman/v4/libpod/define"
+	"fmt"
+
+	"github.com/containers/podman/v5/libpod/define"
 	pluginapi "github.com/docker/go-plugins-helpers/volume"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -29,7 +32,7 @@ func (v *Volume) Inspect() (*define.InspectVolumeData, error) {
 		data.Mountpoint = v.state.MountPoint
 
 		if v.plugin == nil {
-			return nil, errors.Wrapf(define.ErrMissingPlugin, "volume %s uses volume plugin %s but it is not available, cannot inspect", v.Name(), v.config.Driver)
+			return nil, fmt.Errorf("volume %s uses volume plugin %s but it is not available, cannot inspect: %w", v.Name(), v.config.Driver, define.ErrMissingPlugin)
 		}
 
 		// Retrieve status for the volume.
@@ -38,7 +41,7 @@ func (v *Volume) Inspect() (*define.InspectVolumeData, error) {
 		req.Name = v.Name()
 		resp, err := v.plugin.GetVolume(req)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error retrieving volume %s information from plugin %s", v.Name(), v.Driver())
+			return nil, fmt.Errorf("retrieving volume %s information from plugin %s: %w", v.Name(), v.Driver(), err)
 		}
 		if resp != nil {
 			data.Status = resp.Status
@@ -63,6 +66,14 @@ func (v *Volume) Inspect() (*define.InspectVolumeData, error) {
 	data.MountCount = v.state.MountCount
 	data.NeedsCopyUp = v.state.NeedsCopyUp
 	data.NeedsChown = v.state.NeedsChown
+	data.StorageID = v.config.StorageID
+	data.LockNumber = v.lock.ID()
+
+	if v.config.Timeout != nil {
+		data.Timeout = *v.config.Timeout
+	} else if v.UsesVolumeDriver() {
+		data.Timeout = v.runtime.config.Engine.VolumePluginTimeout
+	}
 
 	return data, nil
 }

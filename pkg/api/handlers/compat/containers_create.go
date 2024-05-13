@@ -2,6 +2,7 @@ package compat
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -10,42 +11,44 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/containers/buildah/pkg/parse"
+	"github.com/containers/common/libimage"
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/cgroups"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/api/handlers"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/specgen"
-	"github.com/containers/podman/v4/pkg/specgenutil"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/specgenutil"
 	"github.com/containers/storage"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
 )
 
 func CreateContainer(w http.ResponseWriter, r *http.Request) {
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
-	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
+	decoder := utils.GetDecoder(r)
 	query := struct {
-		Name string `schema:"name"`
+		Name     string `schema:"name"`
+		Platform string `schema:"platform"`
 	}{
 		// override any golang type defaults
 	}
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusBadRequest, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
 		return
 	}
 
 	// compatible configuration
 	body := handlers.CreateContainerConfig{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "Decode()"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("decode(): %w", err))
 		return
 	}
 
@@ -53,37 +56,46 @@ func CreateContainer(w http.ResponseWriter, r *http.Request) {
 	body.Name = query.Name
 
 	if len(body.HostConfig.Links) > 0 {
-		utils.Error(w, http.StatusBadRequest, errors.Wrapf(utils.ErrLinkNotSupport, "bad parameter"))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("bad parameter: %w", utils.ErrLinkNotSupport))
 		return
 	}
 	rtc, err := runtime.GetConfig()
 	if err != nil {
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "unable to get runtime config"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("unable to get runtime config: %w", err))
 		return
 	}
 
 	imageName, err := utils.NormalizeToDockerHub(r, body.Config.Image)
 	if err != nil {
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "error normalizing image"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("normalizing image: %w", err))
 		return
 	}
 	body.Config.Image = imageName
 
-	newImage, resolvedName, err := runtime.LibimageRuntime().LookupImage(body.Config.Image, nil)
+	lookupImageOptions := libimage.LookupImageOptions{}
+	if query.Platform != "" {
+		var err error
+		lookupImageOptions.OS, lookupImageOptions.Architecture, lookupImageOptions.Variant, err = parse.Platform(query.Platform)
+		if err != nil {
+			utils.Error(w, http.StatusBadRequest, fmt.Errorf("parsing platform: %w", err))
+			return
+		}
+	}
+	newImage, resolvedName, err := runtime.LibimageRuntime().LookupImage(body.Config.Image, &lookupImageOptions)
 	if err != nil {
-		if errors.Cause(err) == storage.ErrImageUnknown {
-			utils.Error(w, http.StatusNotFound, errors.Wrap(err, "No such image"))
+		if errors.Is(err, storage.ErrImageUnknown) {
+			utils.Error(w, http.StatusNotFound, fmt.Errorf("no such image: %w", err))
 			return
 		}
 
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "error looking up image"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("looking up image: %w", err))
 		return
 	}
 
 	// Take body structure and convert to cliopts
 	cliOpts, args, err := cliOpts(body, rtc)
 	if err != nil {
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "make cli opts()"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("make cli opts(): %w", err))
 		return
 	}
 
@@ -100,16 +112,19 @@ func CreateContainer(w http.ResponseWriter, r *http.Request) {
 
 	sg := specgen.NewSpecGenerator(imgNameOrID, cliOpts.RootFS)
 	if err := specgenutil.FillOutSpecGen(sg, cliOpts, args); err != nil {
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "fill out specgen"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("fill out specgen: %w", err))
 		return
 	}
 	// moby always create the working directory
-	sg.CreateWorkingDir = true
+	localTrue := true
+	sg.CreateWorkingDir = &localTrue
+	// moby doesn't inherit /etc/hosts from host
+	sg.BaseHostsFile = "none"
 
 	ic := abi.ContainerEngine{Libpod: runtime}
 	report, err := ic.ContainerCreate(r.Context(), sg)
 	if err != nil {
-		utils.Error(w, http.StatusInternalServerError, errors.Wrap(err, "container create"))
+		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("container create: %w", err))
 		return
 	}
 	createResponse := entities.ContainerCreateResponse{
@@ -262,11 +277,19 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 	}
 
 	// special case for NetworkMode, the podman default is slirp4netns for
-	// rootless but for better docker compat we want bridge.
+	// rootless but for better docker compat we want bridge. Do this only if
+	// the default config in containers.conf wasn't overridden to use another
+	// value than the default "private" one.
 	netmode := string(cc.HostConfig.NetworkMode)
+	configDefaultNetNS := rtc.Containers.NetNS
 	if netmode == "" || netmode == "default" {
-		netmode = "bridge"
+		if configDefaultNetNS == "" || configDefaultNetNS == string(specgen.Default) || configDefaultNetNS == string(specgen.Private) {
+			netmode = "bridge"
+		} else {
+			netmode = configDefaultNetNS
+		}
 	}
+
 	nsmode, networks, netOpts, err := specgen.ParseNetworkFlag([]string{netmode})
 	if err != nil {
 		return nil, nil, err
@@ -286,6 +309,14 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 		NoHosts:        rtc.Containers.NoHosts,
 	}
 
+	// docker-compose sets the mac address on the container config instead
+	// on the per network endpoint config
+	//
+	// This field is deprecated since API v1.44 where
+	// EndpointSettings.MacAddress is used instead (and has precedence
+	// below).  Let's still use it for backwards compat.
+	containerMacAddress := cc.MacAddress //nolint:staticcheck
+
 	// network names
 	switch {
 	case len(cc.NetworkingConfig.EndpointsConfig) > 0:
@@ -300,7 +331,7 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 				if len(endpoint.IPAddress) > 0 {
 					staticIP := net.ParseIP(endpoint.IPAddress)
 					if staticIP == nil {
-						return nil, nil, errors.Errorf("failed to parse the ip address %q", endpoint.IPAddress)
+						return nil, nil, fmt.Errorf("failed to parse the ip address %q", endpoint.IPAddress)
 					}
 					netOpts.StaticIPs = append(netOpts.StaticIPs, staticIP)
 				}
@@ -310,7 +341,7 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 					if len(endpoint.IPAMConfig.IPv4Address) > 0 {
 						staticIP := net.ParseIP(endpoint.IPAMConfig.IPv4Address)
 						if staticIP == nil {
-							return nil, nil, errors.Errorf("failed to parse the ipv4 address %q", endpoint.IPAMConfig.IPv4Address)
+							return nil, nil, fmt.Errorf("failed to parse the ipv4 address %q", endpoint.IPAMConfig.IPv4Address)
 						}
 						netOpts.StaticIPs = append(netOpts.StaticIPs, staticIP)
 					}
@@ -318,7 +349,7 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 					if len(endpoint.IPAMConfig.IPv6Address) > 0 {
 						staticIP := net.ParseIP(endpoint.IPAMConfig.IPv6Address)
 						if staticIP == nil {
-							return nil, nil, errors.Errorf("failed to parse the ipv6 address %q", endpoint.IPAMConfig.IPv6Address)
+							return nil, nil, fmt.Errorf("failed to parse the ipv6 address %q", endpoint.IPAMConfig.IPv6Address)
 						}
 						netOpts.StaticIPs = append(netOpts.StaticIPs, staticIP)
 					}
@@ -327,13 +358,33 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 				if len(endpoint.MacAddress) > 0 {
 					staticMac, err := net.ParseMAC(endpoint.MacAddress)
 					if err != nil {
-						return nil, nil, errors.Errorf("failed to parse the mac address %q", endpoint.MacAddress)
+						return nil, nil, fmt.Errorf("failed to parse the mac address %q", endpoint.MacAddress)
 					}
 					netOpts.StaticMAC = types.HardwareAddr(staticMac)
+				} else if len(containerMacAddress) > 0 {
+					// docker-compose only sets one mac address for the container on the container config
+					// If there are more than one network attached it will end up on the first one,
+					// which is not deterministic since we iterate a map. Not nice but this matches docker.
+					staticMac, err := net.ParseMAC(containerMacAddress)
+					if err != nil {
+						return nil, nil, fmt.Errorf("failed to parse the mac address %q", containerMacAddress)
+					}
+					netOpts.StaticMAC = types.HardwareAddr(staticMac)
+					containerMacAddress = ""
 				}
 			}
 
-			networks[netName] = netOpts
+			// Report configuration error in case bridge mode is not used.
+			if !nsmode.IsBridge() && (len(netOpts.Aliases) > 0 || len(netOpts.StaticIPs) > 0 || len(netOpts.StaticMAC) > 0) {
+				return nil, nil, fmt.Errorf("networks and static ip/mac address can only be used with Bridge mode networking")
+			} else if nsmode.IsBridge() {
+				// Docker CLI now always sends the end point config when using the default (bridge) mode
+				// however podman configuration doesn't expect this to define this at all when not in bridge
+				// mode and the podman server config might override the default network mode to something
+				// else than bridge. So adapt to the podman expectation and define custom end point config
+				// only when really using the bridge mode.
+				networks[netName] = netOpts
+			}
 		}
 
 		netInfo.Networks = networks
@@ -371,7 +422,7 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 		// Detach:            false, // don't need
 		// DetachKeys:        "",    // don't need
 		Devices:           devices,
-		DeviceCgroupRule:  nil,
+		DeviceCgroupRule:  cc.HostConfig.DeviceCgroupRules,
 		DeviceReadBPs:     readBps,
 		DeviceReadIOPs:    readIops,
 		DeviceWriteBPs:    writeBps,
@@ -381,7 +432,7 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 		Expose:            expose,
 		GroupAdd:          cc.HostConfig.GroupAdd,
 		Hostname:          cc.Config.Hostname,
-		ImageVolume:       "bind",
+		ImageVolume:       "anonymous",
 		Init:              init,
 		Interactive:       cc.Config.OpenStdin,
 		IPC:               string(cc.HostConfig.IpcMode),
@@ -399,15 +450,18 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 		PublishAll:        cc.HostConfig.PublishAllPorts,
 		Quiet:             false,
 		ReadOnly:          cc.HostConfig.ReadonlyRootfs,
-		ReadOnlyTmpFS:     true, // podman default
+		ReadWriteTmpFS:    true, // podman default
 		Rm:                cc.HostConfig.AutoRemove,
+		Annotation:        stringMaptoArray(cc.HostConfig.Annotations),
 		SecurityOpt:       cc.HostConfig.SecurityOpt,
 		StopSignal:        cc.Config.StopSignal,
+		StopTimeout:       rtc.Engine.StopTimeout, // podman default
 		StorageOpts:       stringMaptoArray(cc.HostConfig.StorageOpt),
 		Sysctl:            stringMaptoArray(cc.HostConfig.Sysctls),
 		Systemd:           "true", // podman default
 		TmpFS:             parsedTmp,
 		TTY:               cc.Config.Tty,
+		EnvMerge:          cc.EnvMerge,
 		UnsetEnv:          cc.UnsetEnv,
 		UnsetEnvAll:       cc.UnsetEnvAll,
 		User:              cc.Config.User,
@@ -433,7 +487,7 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 	}
 	if cc.HostConfig.Resources.NanoCPUs > 0 {
 		if cliOpts.CPUPeriod != 0 || cliOpts.CPUQuota != 0 {
-			return nil, nil, errors.Errorf("NanoCpus conflicts with CpuPeriod and CpuQuota")
+			return nil, nil, fmt.Errorf("NanoCpus conflicts with CpuPeriod and CpuQuota")
 		}
 		cliOpts.CPUPeriod = 100000
 		cliOpts.CPUQuota = cc.HostConfig.Resources.NanoCPUs / 10000
@@ -461,7 +515,7 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 	// This also handles volumes duplicated between cc.HostConfig.Mounts and
 	// cc.Volumes, as seen in compose v2.0.
 	for vol := range cc.Volumes {
-		if _, ok := volDestinations[filepath.Clean(vol)]; ok {
+		if _, ok := volDestinations[vol]; ok {
 			continue
 		}
 		cliOpts.Volume = append(cliOpts.Volume, vol)
@@ -474,12 +528,12 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 			continue
 		}
 		// If volume already exists, there is nothing to do
-		if _, err := os.Stat(vol); err == nil {
+		if err := fileutils.Exists(vol); err == nil {
 			continue
 		}
 		if err := os.MkdirAll(vol, 0o755); err != nil {
 			if !os.IsExist(err) {
-				return nil, nil, errors.Wrapf(err, "error making volume mountpoint for volume %s", vol)
+				return nil, nil, fmt.Errorf("making volume mountpoint for volume %s: %w", vol, err)
 			}
 		}
 	}
@@ -519,7 +573,7 @@ func cliOpts(cc handlers.CreateContainerConfig, rtc *config.Config) (*entities.C
 	}
 
 	if len(cc.HostConfig.RestartPolicy.Name) > 0 {
-		policy := cc.HostConfig.RestartPolicy.Name
+		policy := string(cc.HostConfig.RestartPolicy.Name)
 		// only add restart count on failure
 		if cc.HostConfig.RestartPolicy.IsOnFailure() {
 			policy += fmt.Sprintf(":%d", cc.HostConfig.RestartPolicy.MaximumRetryCount)

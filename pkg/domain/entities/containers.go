@@ -7,9 +7,10 @@ import (
 	"time"
 
 	nettypes "github.com/containers/common/libnetwork/types"
-	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/specgen"
+	imageTypes "github.com/containers/image/v5/types"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities/types"
+	"github.com/containers/podman/v5/pkg/specgen"
 	"github.com/containers/storage/pkg/archive"
 )
 
@@ -43,21 +44,31 @@ type ContainerRunlabelOptions struct {
 	SignaturePolicy string
 	// SkipTLSVerify - skip HTTPS and certificate verifications when
 	// contacting registries.
-	SkipTLSVerify types.OptionalBool
+	SkipTLSVerify imageTypes.OptionalBool
 }
 
 // ContainerRunlabelReport contains the results from executing container-runlabel.
 type ContainerRunlabelReport struct{}
 
+// WaitOptions are arguments for waiting for a container.
 type WaitOptions struct {
-	Condition []define.ContainerStatus
-	Interval  time.Duration
-	Latest    bool
+	// Conditions to wait on.  Includes container statuses such as
+	// "running" or "stopped" and health-related values such "healthy".
+	Conditions []string
+	// Time interval to wait before polling for completion.
+	Interval time.Duration
+	// Ignore errors when a specified container is missing and mark its
+	// return code as -1.
+	Ignore bool
+	// Use the latest created container.
+	Latest bool
 }
 
+// WaitReport is the result of waiting a container.
 type WaitReport struct {
-	Id       string //nolint
-	Error    error
+	// Error while waiting.
+	Error error
+	// ExitCode of the container.
 	ExitCode int32
 }
 
@@ -71,15 +82,19 @@ type StringSliceReport struct {
 }
 
 type PauseUnPauseOptions struct {
-	All bool
+	Filters map[string][]string
+	All     bool
+	Latest  bool
 }
 
 type PauseUnpauseReport struct {
-	Err error
-	Id  string //nolint
+	Err      error
+	Id       string //nolint:revive,stylecheck
+	RawInput string
 }
 
 type StopOptions struct {
+	Filters map[string][]string
 	All     bool
 	Ignore  bool
 	Latest  bool
@@ -88,7 +103,7 @@ type StopOptions struct {
 
 type StopReport struct {
 	Err      error
-	Id       string //nolint
+	Id       string //nolint:revive,stylecheck
 	RawInput string
 }
 
@@ -110,11 +125,12 @@ type KillOptions struct {
 
 type KillReport struct {
 	Err      error
-	Id       string //nolint
+	Id       string //nolint:revive,stylecheck
 	RawInput string
 }
 
 type RestartOptions struct {
+	Filters map[string][]string
 	All     bool
 	Latest  bool
 	Running bool
@@ -122,11 +138,13 @@ type RestartOptions struct {
 }
 
 type RestartReport struct {
-	Err error
-	Id  string //nolint
+	Err      error
+	Id       string //nolint:revive,stylecheck
+	RawInput string
 }
 
 type RmOptions struct {
+	Filters map[string][]string
 	All     bool
 	Depend  bool
 	Force   bool
@@ -140,13 +158,12 @@ type ContainerInspectReport struct {
 	*define.InspectContainerData
 }
 
-type ContainerStatReport struct {
-	define.FileInfo
-}
+type ContainerStatReport = types.ContainerStatReport
 
 type CommitOptions struct {
 	Author         string
 	Changes        []string
+	Config         []byte
 	Format         string
 	ImageName      string
 	IncludeVolumes bool
@@ -170,11 +187,11 @@ type CopyOptions struct {
 }
 
 type CommitReport struct {
-	Id string //nolint
+	Id string //nolint:revive,stylecheck
 }
 
 type ContainerExportOptions struct {
-	Output string
+	Output io.Writer
 }
 
 type CheckpointOptions struct {
@@ -194,12 +211,7 @@ type CheckpointOptions struct {
 	FileLocks      bool
 }
 
-type CheckpointReport struct {
-	Err             error                                   `json:"-"`
-	Id              string                                  `json:"Id` //nolint
-	RuntimeDuration int64                                   `json:"runtime_checkpoint_duration"`
-	CRIUStatistics  *define.CRIUCheckpointRestoreStatistics `json:"criu_statistics"`
-}
+type CheckpointReport = types.CheckpointReport
 
 type RestoreOptions struct {
 	All             bool
@@ -220,15 +232,10 @@ type RestoreOptions struct {
 	FileLocks       bool
 }
 
-type RestoreReport struct {
-	Err             error                                   `json:"-"`
-	Id              string                                  `json:"Id` //nolint
-	RuntimeDuration int64                                   `json:"runtime_restore_duration"`
-	CRIUStatistics  *define.CRIUCheckpointRestoreStatistics `json:"criu_statistics"`
-}
+type RestoreReport = types.RestoreReport
 
 type ContainerCreateReport struct {
-	Id string //nolint
+	Id string //nolint:revive,stylecheck
 }
 
 // AttachOptions describes the cli and other values
@@ -278,6 +285,7 @@ type ExecOptions struct {
 	Interactive bool
 	Latest      bool
 	PreserveFDs uint
+	PreserveFD  []uint
 	Privileged  bool
 	Tty         bool
 	User        string
@@ -307,7 +315,7 @@ type ContainerStartOptions struct {
 // ContainerStartReport describes the response from starting
 // containers from the cli
 type ContainerStartReport struct {
-	Id       string //nolint
+	Id       string //nolint:revive,stylecheck
 	RawInput string
 	Err      error
 	ExitCode int
@@ -341,6 +349,7 @@ type ContainerRunOptions struct {
 	InputStream  *os.File
 	OutputStream *os.File
 	PreserveFDs  uint
+	PreserveFD   []uint
 	Rm           bool
 	SigProxy     bool
 	Spec         *specgen.SpecGenerator
@@ -351,7 +360,7 @@ type ContainerRunOptions struct {
 // a container
 type ContainerRunReport struct {
 	ExitCode int
-	Id       string //nolint
+	Id       string //nolint:revive,stylecheck
 }
 
 // ContainerCleanupOptions are the CLI values for the
@@ -368,7 +377,8 @@ type ContainerCleanupOptions struct {
 // container cleanup
 type ContainerCleanupReport struct {
 	CleanErr error
-	Id       string //nolint
+	Id       string //nolint:revive,stylecheck
+	RawInput string
 	RmErr    error
 	RmiErr   error
 }
@@ -383,8 +393,9 @@ type ContainerInitOptions struct {
 // ContainerInitReport describes the results of a
 // container init
 type ContainerInitReport struct {
-	Err error
-	Id  string //nolint
+	Err      error
+	Id       string //nolint:revive,stylecheck
+	RawInput string
 }
 
 // ContainerMountOptions describes the input values for mounting containers
@@ -406,7 +417,7 @@ type ContainerUnmountOptions struct {
 // ContainerMountReport describes the response from container mount
 type ContainerMountReport struct {
 	Err  error
-	Id   string //nolint
+	Id   string //nolint:revive,stylecheck
 	Name string
 	Path string
 }
@@ -414,7 +425,7 @@ type ContainerMountReport struct {
 // ContainerUnmountReport describes the response from umounting a container
 type ContainerUnmountReport struct {
 	Err error
-	Id  string //nolint
+	Id  string //nolint:revive,stylecheck
 }
 
 // ContainerPruneOptions describes the options needed
@@ -433,7 +444,7 @@ type ContainerPortOptions struct {
 // ContainerPortReport describes the output needed for
 // the CLI to output ports
 type ContainerPortReport struct {
-	Id    string //nolint
+	Id    string //nolint:revive,stylecheck
 	Ports []nettypes.PortMapping
 }
 
@@ -451,6 +462,8 @@ type ContainerCpOptions struct {
 // ContainerStatsOptions describes input options for getting
 // stats on containers
 type ContainerStatsOptions struct {
+	// Get all containers stats
+	All bool
 	// Operate on the latest known container.  Only supported for local
 	// clients.
 	Latest bool
@@ -460,13 +473,7 @@ type ContainerStatsOptions struct {
 	Interval int
 }
 
-// ContainerStatsReport is used for streaming container stats.
-type ContainerStatsReport struct {
-	// Error from reading stats.
-	Error error
-	// Results, set when there is no error.
-	Stats []define.ContainerStats
-}
+type ContainerStatsReport = types.ContainerStatsReport
 
 // ContainerRenameOptions describes input options for renaming a container.
 type ContainerRenameOptions struct {
@@ -474,7 +481,7 @@ type ContainerRenameOptions struct {
 	NewName string
 }
 
-// ContainerCloneOptions contains options for cloning an existing continer
+// ContainerCloneOptions contains options for cloning an existing container
 type ContainerCloneOptions struct {
 	ID           string
 	Destroy      bool
@@ -484,3 +491,6 @@ type ContainerCloneOptions struct {
 	Run          bool
 	Force        bool
 }
+
+// ContainerUpdateOptions containers options for updating an existing containers cgroup configuration
+type ContainerUpdateOptions = types.ContainerUpdateOptions

@@ -1,15 +1,16 @@
+//go:build !remote
+
 package generate
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	buildahDefine "github.com/containers/buildah/define"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
 )
 
 // PullOrBuildInfraImage pulls down the specified image or the one set in
@@ -53,7 +54,7 @@ func buildPauseImage(rt *libpod.Runtime, rtConfig *config.Config) (string, error
 
 	// Also look into the path as some distributions install catatonit in
 	// /usr/bin.
-	catatonitPath, err := rtConfig.FindHelperBinary("catatonit", true)
+	catatonitPath, err := rtConfig.FindInitBinary()
 	if err != nil {
 		return "", fmt.Errorf("finding pause binary: %w", err)
 	}
@@ -62,7 +63,7 @@ func buildPauseImage(rt *libpod.Runtime, rtConfig *config.Config) (string, error
 COPY %s /catatonit
 ENTRYPOINT ["/catatonit", "-P"]`, catatonitPath)
 
-	tmpF, err := ioutil.TempFile("", "pause.containerfile")
+	tmpF, err := os.CreateTemp("", "pause.containerfile")
 	if err != nil {
 		return "", err
 	}

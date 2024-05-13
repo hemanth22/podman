@@ -1,27 +1,24 @@
 //go:build amd64 || arm64
-// +build amd64 arm64
 
 package machine
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	url2 "net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/containers/image/v5/pkg/compression"
-	"github.com/containers/storage/pkg/archive"
+	"github.com/containers/podman/v5/pkg/machine/compression"
+	"github.com/containers/podman/v5/pkg/machine/define"
+	"github.com/containers/podman/v5/pkg/machine/env"
+	"github.com/containers/podman/v5/pkg/machine/ocipull"
+	"github.com/containers/podman/v5/utils"
 	"github.com/sirupsen/logrus"
-	"github.com/ulikunitz/xz"
-	"github.com/vbauerster/mpb/v7"
-	"github.com/vbauerster/mpb/v7/decor"
 )
 
 // GenericDownload is used when a user provides a URL
@@ -31,55 +28,66 @@ type GenericDownload struct {
 }
 
 // NewGenericDownloader is used when the disk image is provided by the user
-func NewGenericDownloader(vmType, vmName, pullPath string) (DistributionDownload, error) {
+func NewGenericDownloader(vmType define.VMType, vmName, pullPath string) (DistributionDownload, error) {
 	var (
 		imageName string
 	)
-	dataDir, err := GetDataDir(vmType)
+	dataDir, err := env.GetDataDir(vmType)
+	if err != nil {
+		return nil, err
+	}
+	cacheDir, err := env.GetCacheDir(vmType)
 	if err != nil {
 		return nil, err
 	}
 	dl := Download{}
 	// Is pullpath a file or url?
-	getURL, err := url2.Parse(pullPath)
-	if err != nil {
-		return nil, err
-	}
-	if len(getURL.Scheme) > 0 {
+	if getURL := supportedURL(pullPath); getURL != nil {
 		urlSplit := strings.Split(getURL.Path, "/")
 		imageName = urlSplit[len(urlSplit)-1]
-		dl.LocalUncompressedFile = filepath.Join(dataDir, imageName)
 		dl.URL = getURL
-		dl.LocalPath = filepath.Join(dataDir, imageName)
+		dl.LocalPath = filepath.Join(cacheDir, imageName)
 	} else {
 		// Dealing with FilePath
 		imageName = filepath.Base(pullPath)
-		dl.LocalUncompressedFile = filepath.Join(dataDir, imageName)
 		dl.LocalPath = pullPath
 	}
 	dl.VMName = vmName
 	dl.ImageName = imageName
+	dl.LocalUncompressedFile = dl.GetLocalUncompressedFile(dataDir)
 	// The download needs to be pulled into the datadir
 
 	gd := GenericDownload{Download: dl}
-	gd.LocalUncompressedFile = gd.getLocalUncompressedName()
 	return gd, nil
 }
 
-func (d Download) getLocalUncompressedName() string {
-	var (
-		extension string
-	)
-	switch {
-	case strings.HasSuffix(d.LocalPath, ".bz2"):
-		extension = ".bz2"
-	case strings.HasSuffix(d.LocalPath, ".gz"):
-		extension = ".gz"
-	case strings.HasSuffix(d.LocalPath, ".xz"):
-		extension = ".xz"
+func supportedURL(path string) (url *url2.URL) {
+	getURL, err := url2.Parse(path)
+	if err != nil {
+		// ignore error, probably not a URL, fallback & treat as file path
+		return nil
 	}
-	uncompressedFilename := filepath.Join(filepath.Dir(d.LocalPath), d.VMName+"_"+d.ImageName)
-	return strings.TrimSuffix(uncompressedFilename, extension)
+
+	// Check supported scheme. Since URL is passed to net.http, only http
+	// schemes are supported. Also, windows drive paths can resemble a
+	// URL, but with a single letter scheme. These values should be
+	// passed through for interpretation as a file path.
+	switch getURL.Scheme {
+	case "http":
+		fallthrough
+	case "https":
+		return getURL
+	default:
+		return nil
+	}
+}
+
+func (dl Download) GetLocalUncompressedFile(dataDir string) string {
+	compressedFilename := dl.VMName + "_" + dl.ImageName
+	extension := compression.KindFromFile(compressedFilename)
+	uncompressedFile := strings.TrimSuffix(compressedFilename, fmt.Sprintf(".%s", extension.String()))
+	dl.LocalUncompressedFile = filepath.Join(dataDir, uncompressedFile)
+	return dl.LocalUncompressedFile
 }
 
 func (g GenericDownload) Get() *Download {
@@ -91,6 +99,18 @@ func (g GenericDownload) HasUsableCache() (bool, error) {
 	return g.URL == nil, nil
 }
 
+// CleanCache cleans out downloaded uncompressed image files
+func (g GenericDownload) CleanCache() error {
+	// Remove any image that has been downloaded via URL
+	// We never read from cache for generic downloads
+	if g.URL != nil {
+		if err := os.Remove(g.LocalPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 func DownloadImage(d DistributionDownload) error {
 	// check if the latest image is already present
 	ok, err := d.HasUsableCache()
@@ -98,16 +118,26 @@ func DownloadImage(d DistributionDownload) error {
 		return err
 	}
 	if !ok {
-		if err := DownloadVMImage(d.Get().URL, d.Get().LocalPath); err != nil {
+		if err := DownloadVMImage(d.Get().URL, d.Get().ImageName, d.Get().LocalPath); err != nil {
 			return err
 		}
+		// Clean out old cached images, since we didn't find needed image in cache
+		defer func() {
+			if err = d.CleanCache(); err != nil {
+				logrus.Warnf("error cleaning machine image cache: %s", err)
+			}
+		}()
 	}
-	return Decompress(d.Get().LocalPath, d.Get().getLocalUncompressedName())
+	localPath, err := define.NewMachineFile(d.Get().LocalPath, nil)
+	if err != nil {
+		return err
+	}
+	return compression.Decompress(localPath, d.Get().LocalUncompressedFile)
 }
 
 // DownloadVMImage downloads a VM image from url to given path
 // with download status
-func DownloadVMImage(downloadURL *url2.URL, localImagePath string) error {
+func DownloadVMImage(downloadURL *url2.URL, imageName string, localImagePath string) error {
 	out, err := os.Create(localImagePath)
 	if err != nil {
 		return err
@@ -132,24 +162,10 @@ func DownloadVMImage(downloadURL *url2.URL, localImagePath string) error {
 		return fmt.Errorf("downloading VM image %s: %s", downloadURL, resp.Status)
 	}
 	size := resp.ContentLength
-	urlSplit := strings.Split(downloadURL.Path, "/")
-	prefix := "Downloading VM image: " + urlSplit[len(urlSplit)-1]
+	prefix := "Downloading VM image: " + imageName
 	onComplete := prefix + ": done"
 
-	p := mpb.New(
-		mpb.WithWidth(60),
-		mpb.WithRefreshRate(180*time.Millisecond),
-	)
-
-	bar := p.AddBar(size,
-		mpb.BarFillerClearOnComplete(),
-		mpb.PrependDecorators(
-			decor.OnComplete(decor.Name(prefix), onComplete),
-		),
-		mpb.AppendDecorators(
-			decor.OnComplete(decor.CountersKibiByte("%.1f / %.1f"), ""),
-		),
-	)
+	p, bar := utils.ProgressBar(prefix, size, onComplete)
 
 	proxyReader := bar.ProxyReader(resp.Body)
 	defer func() {
@@ -166,90 +182,53 @@ func DownloadVMImage(downloadURL *url2.URL, localImagePath string) error {
 	return nil
 }
 
-func Decompress(localPath, uncompressedPath string) error {
-	uncompressedFileWriter, err := os.OpenFile(uncompressedPath, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	sourceFile, err := ioutil.ReadFile(localPath)
-	if err != nil {
-		return err
-	}
-
-	compressionType := archive.DetectCompression(sourceFile)
-	if compressionType != archive.Uncompressed {
-		fmt.Println("Extracting compressed file")
-	}
-	if compressionType == archive.Xz {
-		return decompressXZ(localPath, uncompressedFileWriter)
-	}
-	return decompressEverythingElse(localPath, uncompressedFileWriter)
-}
-
-// Will error out if file without .xz already exists
-// Maybe extracting then renameing is a good idea here..
-// depends on xz: not pre-installed on mac, so it becomes a brew dependency
-func decompressXZ(src string, output io.WriteCloser) error {
-	var read io.Reader
-	var cmd *exec.Cmd
-	// Prefer xz utils for fastest performance, fallback to go xi2 impl
-	if _, err := exec.LookPath("xzcat"); err == nil {
-		cmd = exec.Command("xzcat", "-k", src)
-		read, err = cmd.StdoutPipe()
-		if err != nil {
-			return err
+func RemoveImageAfterExpire(dir string, expire time.Duration) error {
+	now := time.Now()
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		// Delete any cache files that are older than expiry date
+		if !info.IsDir() && (now.Sub(info.ModTime()) > expire) {
+			err := os.Remove(path)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				logrus.Warnf("unable to clean up cached image: %s", path)
+			} else {
+				logrus.Debugf("cleaning up cached image: %s", path)
+			}
 		}
-		cmd.Stderr = os.Stderr
-	} else {
-		file, err := os.Open(src)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		// This XZ implementation is reliant on buffering. It is also 3x+ slower than XZ utils.
-		// Consider replacing with a faster implementation (e.g. xi2) if podman machine is
-		// updated with a larger image for the distribution base.
-		buf := bufio.NewReader(file)
-		read, err = xz.NewReader(buf)
-		if err != nil {
-			return err
-		}
-	}
-
-	done := make(chan bool)
-	go func() {
-		if _, err := io.Copy(output, read); err != nil {
-			logrus.Error(err)
-		}
-		output.Close()
-		done <- true
-	}()
-
-	if cmd != nil {
-		return cmd.Run()
-	}
-	<-done
-	return nil
-}
-
-func decompressEverythingElse(src string, output io.WriteCloser) error {
-	f, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	uncompressStream, _, err := compression.AutoDecompress(f)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := uncompressStream.Close(); err != nil {
-			logrus.Error(err)
-		}
-		if err := output.Close(); err != nil {
-			logrus.Error(err)
-		}
-	}()
-
-	_, err = io.Copy(output, uncompressStream)
+		return nil
+	})
 	return err
+}
+
+// AcquireAlternateImage downloads the alternate image the user provided, which
+// can be a file path or URL
+func (dl Download) AcquireAlternateImage(inputPath string) (*define.VMFile, error) {
+	g, err := NewGenericDownloader(dl.VMKind, dl.VMName, inputPath)
+	if err != nil {
+		return nil, err
+	}
+
+	imagePath, err := define.NewMachineFile(g.Get().LocalUncompressedFile, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := DownloadImage(g); err != nil {
+		return nil, err
+	}
+
+	return imagePath, nil
+}
+
+func isOci(input string) (bool, *ocipull.OCIKind, error) { //nolint:unused
+	inputURL, err := url2.Parse(input)
+	if err != nil {
+		return false, nil, err
+	}
+	switch inputURL.Scheme {
+	case ocipull.OCIDir.String():
+		return true, &ocipull.OCIDir, nil
+	case ocipull.OCIRegistry.String():
+		return true, &ocipull.OCIRegistry, nil
+	}
+	return false, nil, nil
 }

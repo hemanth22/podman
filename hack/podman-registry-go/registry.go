@@ -1,10 +1,11 @@
 package registry
 
 import (
+	"fmt"
+	"os"
 	"strings"
 
-	"github.com/containers/podman/v4/utils"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/utils"
 	"github.com/sirupsen/logrus"
 )
 
@@ -33,16 +34,15 @@ type Registry struct {
 
 // Options allows for customizing a registry.
 type Options struct {
+	// PodmanPath - path to podman executable
+	PodmanPath string
+	// PodmanArgs - array of podman options
+	PodmanArgs []string
 	// Image - custom registry image.
 	Image string
 }
 
-// Start a new registry and return it along with it's image, user, password, and port.
-func Start() (*Registry, error) {
-	return StartWithOptions(nil)
-}
-
-// StartWithOptions a new registry and return it along with it's image, user, password, and port.
+// StartWithOptions a new registry and return it along with its image, user, password, and port.
 func StartWithOptions(options *Options) (*Registry, error) {
 	if options == nil {
 		options = &Options{}
@@ -54,10 +54,20 @@ func StartWithOptions(options *Options) (*Registry, error) {
 	}
 	args = append(args, "start")
 
+	podmanCmd := []string{"podman"}
+	if options.PodmanPath != "" {
+		podmanCmd[0] = options.PodmanPath
+	}
+	if len(options.PodmanArgs) != 0 {
+		podmanCmd = append(podmanCmd, options.PodmanArgs...)
+	}
+
 	// Start a registry.
+	os.Setenv("PODMAN", strings.Join(podmanCmd, " "))
 	out, err := utils.ExecCmd(binary, args...)
+	os.Unsetenv("PODMAN")
 	if err != nil {
-		return nil, errors.Wrapf(err, "error running %q: %s", binary, out)
+		return nil, fmt.Errorf("running %q: %s: %w", binary, out, err)
 	}
 
 	// Parse the output.
@@ -68,7 +78,7 @@ func StartWithOptions(options *Options) (*Registry, error) {
 		}
 		spl := strings.Split(s, "=")
 		if len(spl) != 2 {
-			return nil, errors.Errorf("unexpected output format %q: want 'PODMAN_...=...'", s)
+			return nil, fmt.Errorf("unexpected output format %q: want 'PODMAN_...=...'", s)
 		}
 		key := spl[0]
 		val := strings.TrimSuffix(strings.TrimPrefix(spl[1], "\""), "\"")
@@ -88,16 +98,16 @@ func StartWithOptions(options *Options) (*Registry, error) {
 
 	// Extra sanity check.
 	if registry.Image == "" {
-		return nil, errors.Errorf("unexpected output %q: %q missing", out, ImageKey)
+		return nil, fmt.Errorf("unexpected output %q: %q missing", out, ImageKey)
 	}
 	if registry.User == "" {
-		return nil, errors.Errorf("unexpected output %q: %q missing", out, UserKey)
+		return nil, fmt.Errorf("unexpected output %q: %q missing", out, UserKey)
 	}
 	if registry.Password == "" {
-		return nil, errors.Errorf("unexpected output %q: %q missing", out, PassKey)
+		return nil, fmt.Errorf("unexpected output %q: %q missing", out, PassKey)
 	}
 	if registry.Port == "" {
-		return nil, errors.Errorf("unexpected output %q: %q missing", out, PortKey)
+		return nil, fmt.Errorf("unexpected output %q: %q missing", out, PortKey)
 	}
 
 	registry.running = true
@@ -112,7 +122,7 @@ func (r *Registry) Stop() error {
 		return nil
 	}
 	if _, err := utils.ExecCmd(binary, "-P", r.Port, "stop"); err != nil {
-		return errors.Wrapf(err, "error stopping registry (%v) with %q", *r, binary)
+		return fmt.Errorf("stopping registry (%v) with %q: %w", *r, binary, err)
 	}
 	r.running = false
 	return nil

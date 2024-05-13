@@ -3,7 +3,7 @@ package server
 import (
 	"net/http"
 
-	"github.com/containers/podman/v4/pkg/api/handlers/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/libpod"
 	"github.com/gorilla/mux"
 )
 
@@ -60,6 +60,18 @@ func (s *APIServer) registerManifestHandlers(r *mux.Router) error {
 	//    type: string
 	//    required: true
 	//    description: the name or ID of the manifest list
+	//  - in: query
+	//    name: addCompression
+	//    required: false
+	//    description: add existing instances with requested compression algorithms to manifest list
+	//    type: array
+	//    items:
+	//      type: string
+	//  - in: query
+	//    name: forceCompressionFormat
+	//    description: Enforce compressing the layers with the specified --compression and do not reuse differently compressed blobs on the registry.
+	//    type: boolean
+	//    default: false
 	//  - in: path
 	//    name: destination
 	//    type: string
@@ -69,12 +81,17 @@ func (s *APIServer) registerManifestHandlers(r *mux.Router) error {
 	//    name: all
 	//    description: push all images
 	//    type: boolean
-	//    default: false
+	//    default: true
 	//  - in: query
 	//    name: tlsVerify
 	//    type: boolean
-	//    default: false
-	//    description: skip TLS verification for registries
+	//    default: true
+	//    description: Require HTTPS and verify signatures when contacting registries.
+	//  - in: query
+	//    name: quiet
+	//    description: "silences extra stream data on push"
+	//    type: boolean
+	//    default: true
 	// responses:
 	//   200:
 	//     schema:
@@ -86,14 +103,14 @@ func (s *APIServer) registerManifestHandlers(r *mux.Router) error {
 	//   500:
 	//     $ref: "#/responses/internalError"
 	v4.Handle("/{name:.*}/registry/{destination:.*}", s.APIHandler(libpod.ManifestPush)).Methods(http.MethodPost)
-	// swagger:operation POST /libpod/manifests manifests ManifestCreateLibpod
+	// swagger:operation POST /libpod/manifests/{name} manifests ManifestCreateLibpod
 	// ---
 	// summary: Create
 	// description: Create a manifest list
 	// produces:
 	// - application/json
 	// parameters:
-	// - in: query
+	// - in: path
 	//   name: name
 	//   type: string
 	//   description: manifest list or index name to create
@@ -112,6 +129,10 @@ func (s *APIServer) registerManifestHandlers(r *mux.Router) error {
 	//   name: all
 	//   type: boolean
 	//   description: add all contents if given list
+	// - in: query
+	//   name: amend
+	//   type: boolean
+	//   description: modify an existing list if one with the desired name already exists
 	// - in: body
 	//   name: options
 	//   description: options for new manifest
@@ -166,6 +187,11 @@ func (s *APIServer) registerManifestHandlers(r *mux.Router) error {
 	//    type: string
 	//    required: true
 	//    description: the name or ID of the manifest list
+	//  - in: query
+	//    name: tlsVerify
+	//    type: boolean
+	//    default: true
+	//    description: Require HTTPS and verify signatures when contacting registries.
 	// responses:
 	//   200:
 	//     $ref: "#/responses/manifestInspect"
@@ -195,8 +221,8 @@ func (s *APIServer) registerManifestHandlers(r *mux.Router) error {
 	//  - in: query
 	//    name: tlsVerify
 	//    type: boolean
-	//    default: false
-	//    description: skip TLS verification for registries
+	//    default: true
+	//    description: Require HTTPS and verify signatures when contacting registries.
 	//  - in: body
 	//    name: options
 	//    description: options for mutating a manifest

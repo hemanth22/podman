@@ -1,13 +1,15 @@
 package cli
 
-// the cli package contains urfave/cli related structs that help make up
-// the command line for buildah commands. it resides here so other projects
-// that vendor in this code can use them too.
+// the cli package contains spf13/cobra related structs that help make up
+// the command line for buildah commands. this file's contents are better
+// suited for pkg/parse, but since pkg/parse imports pkg/util which also
+// imports pkg/parse, having it there would create a cyclic dependency, so
+// here we are.
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,11 +19,12 @@ import (
 	"github.com/containers/buildah/pkg/parse"
 	"github.com/containers/buildah/pkg/util"
 	"github.com/containers/common/pkg/auth"
-	encconfig "github.com/containers/ocicrypt/config"
-	enchelpers "github.com/containers/ocicrypt/helpers"
-	"github.com/pkg/errors"
+	"github.com/containers/image/v5/docker/reference"
+	"github.com/containers/image/v5/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"golang.org/x/exp/slices"
 )
 
 type BuildOptions struct {
@@ -47,6 +50,18 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 	output := ""
 	cleanTmpFile := false
 	tags := []string{}
+	if iopts.Network == "none" {
+		if c.Flag("dns").Changed {
+			return options, nil, nil, errors.New("the --dns option cannot be used with --network=none")
+		}
+		if c.Flag("dns-option").Changed {
+			return options, nil, nil, errors.New("the --dns-option option cannot be used with --network=none")
+		}
+		if c.Flag("dns-search").Changed {
+			return options, nil, nil, errors.New("the --dns-search option cannot be used with --network=none")
+		}
+
+	}
 	if c.Flag("tag").Changed {
 		tags = iopts.Tag
 		if len(tags) > 0 {
@@ -67,7 +82,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 
 	if c.Flag("logsplit").Changed {
 		if !c.Flag("logfile").Changed {
-			return options, nil, nil, errors.Errorf("cannot use --logsplit without --logfile")
+			return options, nil, nil, errors.New("cannot use --logsplit without --logfile")
 		}
 	}
 
@@ -76,35 +91,22 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		removeAll = append(removeAll, iopts.BudResults.Authfile)
 	}
 
-	// Allow for --pull, --pull=true, --pull=false, --pull=never, --pull=always
-	// --pull-always and --pull-never.  The --pull-never and --pull-always options
-	// will not be documented.
-	pullPolicy := define.PullIfMissing
-	if strings.EqualFold(strings.TrimSpace(iopts.Pull), "true") {
-		pullPolicy = define.PullIfNewer
+	pullPolicy, err := parse.PullPolicyFromOptions(c)
+	if err != nil {
+		return options, nil, nil, err
 	}
-	if iopts.PullAlways || strings.EqualFold(strings.TrimSpace(iopts.Pull), "always") {
-		pullPolicy = define.PullAlways
-	}
-	if iopts.PullNever || strings.EqualFold(strings.TrimSpace(iopts.Pull), "never") {
-		pullPolicy = define.PullNever
-	}
-	logrus.Debugf("Pull Policy for pull [%v]", pullPolicy)
 
 	args := make(map[string]string)
+	if c.Flag("build-arg-file").Changed {
+		for _, argfile := range iopts.BuildArgFile {
+			if err := readBuildArgFile(argfile, args); err != nil {
+				return options, nil, nil, err
+			}
+		}
+	}
 	if c.Flag("build-arg").Changed {
 		for _, arg := range iopts.BuildArg {
-			av := strings.SplitN(arg, "=", 2)
-			if len(av) > 1 {
-				args[av[0]] = av[1]
-			} else {
-				// check if the env is set in the local environment and use that value if it is
-				if val, present := os.LookupEnv(av[0]); present {
-					args[av[0]] = val
-				} else {
-					delete(args, av[0])
-				}
-			}
+			readBuildArg(arg, args)
 		}
 	}
 
@@ -115,7 +117,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 			if len(av) > 1 {
 				parseAdditionalBuildContext, err := parse.GetAdditionalBuildContext(av[1])
 				if err != nil {
-					return options, nil, nil, errors.Wrapf(err, "while parsing additional build context")
+					return options, nil, nil, fmt.Errorf("while parsing additional build context: %w", err)
 				}
 				additionalBuildContext[av[0]] = &parseAdditionalBuildContext
 			} else {
@@ -141,13 +143,13 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 	if len(cliArgs) == 0 {
 		contextDir, err = os.Getwd()
 		if err != nil {
-			return options, nil, nil, errors.Wrapf(err, "unable to choose current working directory as build context")
+			return options, nil, nil, fmt.Errorf("unable to choose current working directory as build context: %w", err)
 		}
 	} else {
 		// The context directory could be a URL.  Try to handle that.
 		tempDir, subDir, err := define.TempDirForURL("", "buildah", cliArgs[0])
 		if err != nil {
-			return options, nil, nil, errors.Wrapf(err, "error prepping temporary context directory")
+			return options, nil, nil, fmt.Errorf("prepping temporary context directory: %w", err)
 		}
 		if tempDir != "" {
 			// We had to download it to a temporary directory.
@@ -158,7 +160,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 			// Nope, it was local.  Use it as is.
 			absDir, err := filepath.Abs(cliArgs[0])
 			if err != nil {
-				return options, nil, nil, errors.Wrapf(err, "error determining path to directory")
+				return options, nil, nil, fmt.Errorf("determining path to directory: %w", err)
 			}
 			contextDir = absDir
 		}
@@ -176,7 +178,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 
 	contextDir, err = filepath.EvalSymlinks(contextDir)
 	if err != nil {
-		return options, nil, nil, errors.Wrapf(err, "error evaluating symlinks in build context path")
+		return options, nil, nil, fmt.Errorf("evaluating symlinks in build context path: %w", err)
 	}
 
 	var stdin io.Reader
@@ -197,7 +199,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 
 	systemContext, err := parse.SystemContextFromOptions(c)
 	if err != nil {
-		return options, nil, nil, errors.Wrapf(err, "error building system context")
+		return options, nil, nil, fmt.Errorf("building system context: %w", err)
 	}
 
 	isolation, err := parse.IsolationOption(iopts.Isolation)
@@ -215,27 +217,8 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 		return options, nil, nil, err
 	}
 
-	pullFlagsCount := 0
-	if c.Flag("pull").Changed {
-		pullFlagsCount++
-	}
-	if c.Flag("pull-always").Changed {
-		pullFlagsCount++
-	}
-	if c.Flag("pull-never").Changed {
-		pullFlagsCount++
-	}
-
-	if pullFlagsCount > 1 {
-		return options, nil, nil, errors.Errorf("can only set one of 'pull' or 'pull-always' or 'pull-never'")
-	}
-
 	if (c.Flag("rm").Changed || c.Flag("force-rm").Changed) && (!c.Flag("layers").Changed && !c.Flag("no-cache").Changed) {
-		return options, nil, nil, errors.Errorf("'rm' and 'force-rm' can only be set with either 'layers' or 'no-cache'")
-	}
-
-	if c.Flag("cache-from").Changed {
-		logrus.Debugf("build --cache-from not enabled, has no effect")
+		return options, nil, nil, errors.New("'rm' and 'force-rm' can only be set with either 'layers' or 'no-cache'")
 	}
 
 	if c.Flag("compress").Changed {
@@ -257,7 +240,7 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 	}
 	usernsOption, idmappingOptions, err := parse.IDMappingOptions(c, isolation)
 	if err != nil {
-		return options, nil, nil, errors.Wrapf(err, "error parsing ID mapping options")
+		return options, nil, nil, fmt.Errorf("parsing ID mapping options: %w", err)
 	}
 	namespaceOptions.AddOrReplace(usernsOption...)
 
@@ -268,12 +251,12 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 
 	decryptConfig, err := DecryptConfig(iopts.DecryptionKeys)
 	if err != nil {
-		return options, nil, nil, errors.Wrapf(err, "unable to obtain decrypt config")
+		return options, nil, nil, fmt.Errorf("unable to obtain decrypt config: %w", err)
 	}
 
 	var excludes []string
 	if iopts.IgnoreFile != "" {
-		if excludes, _, err = parse.ContainerIgnoreFile(contextDir, iopts.IgnoreFile); err != nil {
+		if excludes, _, err = parse.ContainerIgnoreFile(contextDir, iopts.IgnoreFile, containerfiles); err != nil {
 			return options, nil, nil, err
 		}
 	}
@@ -291,74 +274,193 @@ func GenBuildOptions(c *cobra.Command, inputArgs []string, iopts BuildOptions) (
 			iopts.Quiet = true
 		}
 	}
+	var confidentialWorkloadOptions define.ConfidentialWorkloadOptions
+	if c.Flag("cw").Changed {
+		confidentialWorkloadOptions, err = parse.GetConfidentialWorkloadOptions(iopts.CWOptions)
+		if err != nil {
+			return options, nil, nil, err
+		}
+	}
+	var cacheTo []reference.Named
+	var cacheFrom []reference.Named
+	cacheTo = nil
+	cacheFrom = nil
+	if c.Flag("cache-to").Changed {
+		cacheTo, err = parse.RepoNamesToNamedReferences(iopts.CacheTo)
+		if err != nil {
+			return options, nil, nil, fmt.Errorf("unable to parse value provided `%s` to --cache-to: %w", iopts.CacheTo, err)
+		}
+	}
+	if c.Flag("cache-from").Changed {
+		cacheFrom, err = parse.RepoNamesToNamedReferences(iopts.CacheFrom)
+		if err != nil {
+			return options, nil, nil, fmt.Errorf("unable to parse value provided `%s` to --cache-from: %w", iopts.CacheTo, err)
+		}
+	}
+	var cacheTTL time.Duration
+	if c.Flag("cache-ttl").Changed {
+		cacheTTL, err = time.ParseDuration(iopts.CacheTTL)
+		if err != nil {
+			return options, nil, nil, fmt.Errorf("unable to parse value provided %q as --cache-ttl: %w", iopts.CacheTTL, err)
+		}
+		// If user explicitly specified `--cache-ttl=0s`
+		// it would effectively mean that user is asking
+		// to use no cache at all. In such use cases
+		// buildah can skip looking for cache entirely
+		// by setting `--no-cache=true` internally.
+		if int64(cacheTTL) == 0 {
+			logrus.Debug("Setting --no-cache=true since --cache-ttl was set to 0s which effectively means user wants to ignore cache")
+			if c.Flag("no-cache").Changed && !iopts.NoCache {
+				return options, nil, nil, fmt.Errorf("cannot use --cache-ttl with duration as 0 and --no-cache=false")
+			}
+			iopts.NoCache = true
+		}
+	}
+
+	if c.Flag("network").Changed && c.Flag("isolation").Changed {
+		if isolation == define.IsolationChroot {
+			if ns := namespaceOptions.Find(string(specs.NetworkNamespace)); ns != nil {
+				if !ns.Host {
+					return options, nil, nil, fmt.Errorf("cannot set --network other than host with --isolation %s", c.Flag("isolation").Value.String())
+				}
+			}
+		}
+	}
+
+	var sbomScanOptions []define.SBOMScanOptions
+	if c.Flag("sbom").Changed || c.Flag("sbom-scanner-command").Changed || c.Flag("sbom-scanner-image").Changed || c.Flag("sbom-image-output").Changed || c.Flag("sbom-merge-strategy").Changed || c.Flag("sbom-output").Changed || c.Flag("sbom-image-output").Changed || c.Flag("sbom-purl-output").Changed || c.Flag("sbom-image-purl-output").Changed {
+		sbomScanOption, err := parse.SBOMScanOptions(c)
+		if err != nil {
+			return options, nil, nil, err
+		}
+		if !slices.Contains(sbomScanOption.ContextDir, contextDir) {
+			sbomScanOption.ContextDir = append(sbomScanOption.ContextDir, contextDir)
+		}
+		for _, abc := range additionalBuildContext {
+			if !abc.IsURL && !abc.IsImage {
+				sbomScanOption.ContextDir = append(sbomScanOption.ContextDir, abc.Value)
+			}
+		}
+		sbomScanOption.PullPolicy = pullPolicy
+		sbomScanOptions = append(sbomScanOptions, *sbomScanOption)
+	}
+
 	options = define.BuildOptions{
 		AddCapabilities:         iopts.CapAdd,
+		AdditionalBuildContexts: additionalBuildContext,
 		AdditionalTags:          tags,
 		AllPlatforms:            iopts.AllPlatforms,
 		Annotations:             iopts.Annotation,
 		Architecture:            systemContext.ArchitectureChoice,
 		Args:                    args,
-		AdditionalBuildContexts: additionalBuildContext,
 		BlobDirectory:           iopts.BlobCache,
+		BuildOutput:             iopts.BuildOutput,
+		CacheFrom:               cacheFrom,
+		CacheTo:                 cacheTo,
+		CacheTTL:                cacheTTL,
+		CDIConfigDir:            iopts.CDIConfigDir,
 		CNIConfigDir:            iopts.CNIConfigDir,
 		CNIPluginPath:           iopts.CNIPlugInPath,
+		ConfidentialWorkload:    confidentialWorkloadOptions,
+		CPPFlags:                iopts.CPPFlags,
 		CommonBuildOpts:         commonOpts,
 		Compression:             compression,
 		ConfigureNetwork:        networkPolicy,
 		ContextDirectory:        contextDir,
-		CPPFlags:                iopts.CPPFlags,
 		Devices:                 iopts.Devices,
 		DropCapabilities:        iopts.CapDrop,
 		Err:                     stderr,
+		Excludes:                excludes,
 		ForceRmIntermediateCtrs: iopts.ForceRm,
 		From:                    iopts.From,
+		GroupAdd:                iopts.GroupAdd,
 		IDMappingOptions:        idmappingOptions,
 		IIDFile:                 iopts.Iidfile,
+		IgnoreFile:              iopts.IgnoreFile,
 		In:                      stdin,
 		Isolation:               isolation,
-		IgnoreFile:              iopts.IgnoreFile,
+		Jobs:                    &iopts.Jobs,
 		Labels:                  iopts.Label,
+		LayerLabels:             iopts.LayerLabel,
 		Layers:                  layers,
 		LogFile:                 iopts.Logfile,
-		LogSplitByPlatform:      iopts.LogSplitByPlatform,
 		LogRusage:               iopts.LogRusage,
+		LogSplitByPlatform:      iopts.LogSplitByPlatform,
 		Manifest:                iopts.Manifest,
-		MaxPullPushRetries:      MaxPullPushRetries,
+		MaxPullPushRetries:      iopts.Retry,
 		NamespaceOptions:        namespaceOptions,
 		NoCache:                 iopts.NoCache,
 		OS:                      systemContext.OSChoice,
+		OSFeatures:              iopts.OSFeatures,
+		OSVersion:               iopts.OSVersion,
+		OciDecryptConfig:        decryptConfig,
 		Out:                     stdout,
 		Output:                  output,
-		BuildOutput:             iopts.BuildOutput,
 		OutputFormat:            format,
+		Platforms:               platforms,
 		PullPolicy:              pullPolicy,
-		PullPushRetryDelay:      PullPushRetryDelay,
 		Quiet:                   iopts.Quiet,
 		RemoveIntermediateCtrs:  iopts.Rm,
 		ReportWriter:            reporter,
 		Runtime:                 iopts.Runtime,
 		RuntimeArgs:             runtimeFlags,
 		RusageLogFile:           iopts.RusageLogFile,
+		SBOMScanOptions:         sbomScanOptions,
 		SignBy:                  iopts.SignBy,
 		SignaturePolicyPath:     iopts.SignaturePolicy,
+		SkipUnusedStages:        types.NewOptionalBool(iopts.SkipUnusedStages),
 		Squash:                  iopts.Squash,
 		SystemContext:           systemContext,
 		Target:                  iopts.Target,
-		TransientMounts:         iopts.Volumes,
-		OciDecryptConfig:        decryptConfig,
-		Jobs:                    &iopts.Jobs,
-		Excludes:                excludes,
 		Timestamp:               timestamp,
-		Platforms:               platforms,
+		TransientMounts:         iopts.Volumes,
 		UnsetEnvs:               iopts.UnsetEnvs,
-		Envs:                    iopts.Envs,
-		OSFeatures:              iopts.OSFeatures,
-		OSVersion:               iopts.OSVersion,
+		UnsetLabels:             iopts.UnsetLabels,
 	}
+	if iopts.RetryDelay != "" {
+		options.PullPushRetryDelay, err = time.ParseDuration(iopts.RetryDelay)
+		if err != nil {
+			return options, nil, nil, fmt.Errorf("unable to parse value provided %q as --retry-delay: %w", iopts.RetryDelay, err)
+		}
+		// Following log line is used in integration test.
+		logrus.Debugf("Setting MaxPullPushRetries to %d and PullPushRetryDelay to %v", iopts.Retry, options.PullPushRetryDelay)
+	}
+
 	if iopts.Quiet {
-		options.ReportWriter = ioutil.Discard
+		options.ReportWriter = io.Discard
 	}
+
+	options.Envs = LookupEnvVarReferences(iopts.Envs, os.Environ())
+
 	return options, containerfiles, removeAll, nil
+}
+
+func readBuildArgFile(buildargfile string, args map[string]string) error {
+	argfile, err := os.ReadFile(buildargfile)
+	if err != nil {
+		return err
+	}
+	for _, arg := range strings.Split(string(argfile), "\n") {
+		if len(arg) == 0 || arg[0] == '#' {
+			continue
+		}
+		readBuildArg(arg, args)
+	}
+	return err
+}
+
+func readBuildArg(buildarg string, args map[string]string) {
+	av := strings.SplitN(buildarg, "=", 2)
+	if len(av) > 1 {
+		args[av[0]] = av[1]
+	} else {
+		// check if the env is set in the local environment and use that value if it is
+		if val, present := os.LookupEnv(av[0]); present {
+			args[av[0]] = val
+		} else {
+			delete(args, av[0])
+		}
+	}
 }
 
 func getContainerfiles(files []string) []string {
@@ -371,50 +473,4 @@ func getContainerfiles(files []string) []string {
 		}
 	}
 	return containerfiles
-}
-
-// GetFormat translates format string into either docker or OCI format constant
-func GetFormat(format string) (string, error) {
-	switch format {
-	case define.OCI:
-		return define.OCIv1ImageManifest, nil
-	case define.DOCKER:
-		return define.Dockerv2ImageManifest, nil
-	default:
-		return "", errors.Errorf("unrecognized image type %q", format)
-	}
-}
-
-// DecryptConfig translates decryptionKeys into a DescriptionConfig structure
-func DecryptConfig(decryptionKeys []string) (*encconfig.DecryptConfig, error) {
-	decryptConfig := &encconfig.DecryptConfig{}
-	if len(decryptionKeys) > 0 {
-		// decryption
-		dcc, err := enchelpers.CreateCryptoConfig([]string{}, decryptionKeys)
-		if err != nil {
-			return nil, errors.Wrapf(err, "invalid decryption keys")
-		}
-		cc := encconfig.CombineCryptoConfigs([]encconfig.CryptoConfig{dcc})
-		decryptConfig = cc.DecryptConfig
-	}
-
-	return decryptConfig, nil
-}
-
-// EncryptConfig translates encryptionKeys into a EncriptionsConfig structure
-func EncryptConfig(encryptionKeys []string, encryptLayers []int) (*encconfig.EncryptConfig, *[]int, error) {
-	var encLayers *[]int
-	var encConfig *encconfig.EncryptConfig
-
-	if len(encryptionKeys) > 0 {
-		// encryption
-		encLayers = &encryptLayers
-		ecc, err := enchelpers.CreateCryptoConfig(encryptionKeys, []string{})
-		if err != nil {
-			return nil, nil, errors.Wrapf(err, "invalid encryption keys")
-		}
-		cc := encconfig.CombineCryptoConfigs([]encconfig.CryptoConfig{ecc})
-		encConfig = cc.EncryptConfig
-	}
-	return encConfig, encLayers, nil
 }

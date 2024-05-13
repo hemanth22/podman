@@ -4,7 +4,7 @@ package images
 import (
 	"net/url"
 
-	"github.com/containers/podman/v4/pkg/bindings/internal/util"
+	"github.com/containers/podman/v5/pkg/bindings/internal/util"
 )
 
 // Changed returns true if named field has been set
@@ -60,4 +60,34 @@ func (o *RemoveOptions) GetIgnore() bool {
 		return z
 	}
 	return *o.Ignore
+}
+
+// WithLookupManifest set field LookupManifest to given value
+func (o *RemoveOptions) WithLookupManifest(value bool) *RemoveOptions {
+	o.LookupManifest = &value
+	return o
+}
+
+// GetLookupManifest returns value of field LookupManifest
+func (o *RemoveOptions) GetLookupManifest() bool {
+	if o.LookupManifest == nil {
+		var z bool
+		return z
+	}
+	return *o.LookupManifest
+}
+
+// WithNoPrune set field NoPrune to given value
+func (o *RemoveOptions) WithNoPrune(value bool) *RemoveOptions {
+	o.NoPrune = &value
+	return o
+}
+
+// GetNoPrune returns value of field NoPrune
+func (o *RemoveOptions) GetNoPrune() bool {
+	if o.NoPrune == nil {
+		var z bool
+		return z
+	}
+	return *o.NoPrune
 }

@@ -1,8 +1,8 @@
 package events
 
 import (
-	"io/ioutil"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -29,7 +29,7 @@ func TestRotateLog(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		tmp, err := ioutil.TempFile("", "log-rotation-")
+		tmp, err := os.CreateTemp("", "log-rotation-")
 		require.NoError(t, err)
 		defer os.Remove(tmp.Name())
 		defer tmp.Close()
@@ -77,14 +77,8 @@ func TestTruncationOutput(t *testing.T) {
 9
 10
 `
-	contentAfter := `6
-7
-8
-9
-10
-`
 	// Create dummy file
-	tmp, err := ioutil.TempFile("", "log-rotation")
+	tmp, err := os.CreateTemp("", "log-rotation")
 	require.NoError(t, err)
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
@@ -94,17 +88,20 @@ func TestTruncationOutput(t *testing.T) {
 	require.NoError(t, err)
 
 	// Truncate the file
-	beforeTruncation, err := ioutil.ReadFile(tmp.Name())
+	beforeTruncation, err := os.ReadFile(tmp.Name())
 	require.NoError(t, err)
 	err = truncate(tmp.Name())
 	require.NoError(t, err)
-	afterTruncation, err := ioutil.ReadFile(tmp.Name())
+	afterTruncation, err := os.ReadFile(tmp.Name())
 	require.NoError(t, err)
-
-	// Test if rotation was successful
-	require.NoError(t, err, "Log content has changed")
+	// Content has changed
 	require.NotEqual(t, beforeTruncation, afterTruncation)
-	require.Equal(t, string(afterTruncation), contentAfter)
+	split := strings.Split(string(afterTruncation), "\n")
+	require.Len(t, split, 8) // 2 events + 5 rotated lines + last new line
+	require.Contains(t, split[0], "\"Attributes\":{\"io.podman.event.rotate\":\"begin\"}")
+	require.Equal(t, split[1:6], []string{"6", "7", "8", "9", "10"})
+	require.Contains(t, split[6], "\"Attributes\":{\"io.podman.event.rotate\":\"end\"}")
+	require.Contains(t, split[7], "")
 }
 
 func TestRenameLog(t *testing.T) {
@@ -116,9 +113,9 @@ func TestRenameLog(t *testing.T) {
 5
 `
 	// Create two dummy files
-	source, err := ioutil.TempFile("", "removing")
+	source, err := os.CreateTemp("", "removing")
 	require.NoError(t, err)
-	target, err := ioutil.TempFile("", "renaming")
+	target, err := os.CreateTemp("", "renaming")
 	require.NoError(t, err)
 
 	// Write to source dummy file
@@ -126,11 +123,11 @@ func TestRenameLog(t *testing.T) {
 	require.NoError(t, err)
 
 	// Rename the files
-	beforeRename, err := ioutil.ReadFile(source.Name())
+	beforeRename, err := os.ReadFile(source.Name())
 	require.NoError(t, err)
 	err = renameLog(source.Name(), target.Name())
 	require.NoError(t, err)
-	afterRename, err := ioutil.ReadFile(target.Name())
+	afterRename, err := os.ReadFile(target.Name())
 	require.NoError(t, err)
 
 	// Test if renaming was successful

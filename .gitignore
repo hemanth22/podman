@@ -12,8 +12,10 @@ coverprofile
 /docs/*.[158].gz
 /docs/build/
 /docs/remote
+**.DS_Store
 .gopathok
 .idea*
+*.mo
 .nfs*
 *.o
 *.orig
@@ -35,6 +37,7 @@ release.txt
 /test/version/version
 /test/testvol/testvol
 /test/tools/build
+/test/e2e/ginkgo-node-*
 .vscode*
 tags
 result

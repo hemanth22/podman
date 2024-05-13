@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Usage: test-apiv2 [PORT]
+# Usage: test-apiv2 testglob
 #
 # DEVELOPER NOTE: you almost certainly don't need to play in here. See README.
 #
@@ -107,6 +107,22 @@ function is() {
     _show_ok 0 "$testname" "$expect" "$actual"
 }
 
+############
+#  is_not  #  Simple disequality
+############
+function is_not() {
+    local actual=$1
+    local expect_not=$2
+    local testname=$3
+
+    if [ "$actual" != "$expect_not" ]; then
+        # On success, include expected value; this helps readers understand
+        _show_ok 1 "$testname!=$expect"
+        return
+    fi
+    _show_ok 0 "$testname" "!= $expect" "$actual"
+}
+
 ##########
 #  like  #  Compare, but allowing patterns
 ##########
@@ -130,7 +146,9 @@ function like() {
 ##############
 function _show_ok() {
     local ok=$1
-    local testname=$2
+    # Exec tests include control characters; filter them out
+    # Also filter out timestamps, to get consistent test names in logs
+    local testname=$(tr -d \\012 <<<"$2"|sed -e 's/since=[0-9.]\+/since=(T)/'|cat -vT)
 
     # If output is a tty, colorize pass/fail
     local red=
@@ -220,20 +238,41 @@ function jsonify() {
 function t() {
     local method=$1; shift
     local path=$1; shift
-    local -a curl_args
+    local -a curl_args form_args
     local content_type="application/json"
 
     local testname="$method $path"
+
     # POST and PUT requests may be followed by one or more key=value pairs.
     # Slurp the command line until we see a 3-digit status code.
-    if [[ $method = "POST" || $method == "PUT" ]]; then
+    if [[ $method = "POST" || $method == "PUT" || $method == "DELETE" ]]; then
         local -a post_args
+
+        if [[ $method == "POST" ]]; then
+            function _add_curl_args() { curl_args+=(--data-binary @$1); }
+        else
+            function _add_curl_args() { curl_args+=(--upload-file $1); }
+        fi
+
         for arg; do
             case "$arg" in
+                # This is just some hack to avoid adding `-d {}` to curl for endpoints where we really need an empty body.
+                # --disable makes curl not lookup the curlrc file, it shouldn't affect the tests in any way.
+                -)                curl_args+=(--disable);
+                                  shift;;
+                --form=*)         form_args+=(--form);
+                                  form_args+=("${arg#--form=}");
+                                  content_type="multipart/form-data";
+                                  shift;;
                 *=*)              post_args+=("$arg");
                                   shift;;
-                *.tar)            curl_args+=(--data-binary @$arg);
+                *.json)           _add_curl_args $arg;
+                                  content_type="application/json";
+                                  shift;;
+                *.tar)            _add_curl_args $arg;
                                   content_type="application/x-tar";
+                                  shift;;
+                *.yaml)           _add_curl_args $arg;
                                   shift;;
                 application/*)    content_type="$arg";
                                   shift;;
@@ -241,9 +280,12 @@ function t() {
                 *)                die "Internal error: invalid POST arg '$arg'" ;;
             esac
         done
-        if [[ -z "$curl_args" ]]; then
-            curl_args=(-d $(jsonify ${post_args[@]}))
-            testname="$testname [${curl_args[@]}]"
+        if [[ -z "${curl_args[*]}" && -z "${form_args[*]}" ]]; then
+            curl_args=(-d $(jsonify ${post_args[*]}))
+            testname="$testname [${curl_args[*]}]"
+        elif [[ -z "${curl_args[*]}" ]]; then
+            curl_args=(--form request.json=$(jsonify ${post_args[*]}) "${form_args[@]}")
+            testname="$testname [${curl_args[*]} ${form_args[*]}]"
         fi
     fi
 
@@ -273,30 +315,65 @@ function t() {
         curl_args+=("--head")
     fi
 
+    # If this is set, we're *expecting* curl to time out
+    if [[ -n "$APIV2_TEST_EXPECT_TIMEOUT" ]]; then
+        curl_args+=("-m" $APIV2_TEST_EXPECT_TIMEOUT)
+    fi
+
     local expected_code=$1; shift
+
+    if [[ "$expected_code" == "101" ]]; then
+        curl_args+=("-H" "Connection: upgrade" "-H" "Upgrade: tcp")
+    fi
 
     # Log every action we do
     echo "-------------------------------------------------------------" >>$LOG
     echo "\$ $testname"                                                  >>$LOG
     rm -f $WORKDIR/curl.*
-    # -s = silent, but --write-out 'format' gives us important response data
+    # The --write-out 'format' gives us important response data.
     # The hairy "{ ...;rc=$?; } || :" lets us capture curl's exit code and
     # give a helpful diagnostic if it fails.
-    { response=$(curl -s -X $method "${curl_args[@]}"            \
+    : > $WORKDIR/curl.result.out
+    : > $WORKDIR/curl.result.err
+    { response=$(curl -X $method "${curl_args[@]}"               \
                     -H "Content-type: $content_type"             \
                     --dump-header $WORKDIR/curl.headers.out      \
+                    -v --stderr $WORKDIR/curl.result.err         \
                     --write-out '%{http_code}^%{content_type}^%{time_total}' \
                     -o $WORKDIR/curl.result.out "$url"); rc=$?; } || :
+    if [ -n "$PODMAN_TESTS_DUMP_TRACES" ]; then
+        # Dump the results we got back, exactly as we got them back.
+        echo "\$ begin stdout"                                                      >>$LOG
+        test -s $WORKDIR/curl.result.out && od -t x1c $WORKDIR/curl.result.out 2>&1 >>$LOG
+        echo "\$ end stdout"                                                        >>$LOG
+        echo "\$ begin stderr"                                                      >>$LOG
+        test -s $WORKDIR/curl.result.err && cat $WORKDIR/curl.result.err            >>$LOG
+        echo "\$ end stderr"                                                        >>$LOG
+        echo "\$ begin response code^content_type^time_total"                       >>$LOG
+        od -t x1c <<< "$response"                                                   >>$LOG
+        echo "\$ end response"                                                      >>$LOG
+    fi
+
+    # Special case: this means we *expect and want* a timeout
+    if [[ -n "$APIV2_TEST_EXPECT_TIMEOUT" ]]; then
+        # Hardcoded. See curl(1) for list of exit codes
+        if [[ $rc -eq 28 ]]; then
+            _show_ok 1 "$testname: curl timed out (expected)"
+        else
+            _show_ok 0 "$testname: expected curl to time out; it did not"
+        fi
+        return
+    fi
 
     # Any error from curl is instant bad news, from which we can't recover
     if [[ $rc -ne 0 ]]; then
-        die "curl failure ($rc) on $url - cannot continue"
+        die "curl failure ($rc) on $url - cannot continue. args=${curl_args[*]}"
     fi
 
     # Show returned headers (without trailing ^M or empty lines) in log file.
     # Sometimes -- I can't remember why! -- we don't get headers.
     if [[ -e $WORKDIR/curl.headers.out ]]; then
-        tr -d '\015' < $WORKDIR/curl.headers.out | egrep '.' >>$LOG
+        tr -d '\015' < $WORKDIR/curl.headers.out | grep -E '.' >>$LOG
     fi
 
     IFS='^' read actual_code content_type time_total <<<"$response"
@@ -338,7 +415,7 @@ function t() {
 
     # Special case: if response code does not match, dump the response body
     # and skip all further subtests.
-    if [[ $actual_code != $expected_code ]]; then
+    if [[ "$actual_code" != "$expected_code" ]]; then
         echo -e "#  response: $output"
         for i; do
             _show_ok skip "$testname: $i # skip - wrong return code"
@@ -347,7 +424,13 @@ function t() {
     fi
 
     for i; do
-        if expr "$i" : "[^=~]\+=.*" >/dev/null; then
+        if expr "$i" : '[^\!]\+\!=.\+' >/dev/null; then
+            # Disequality on json field
+            json_field=$(expr "$i" : '\([^!]*\)!')
+            expect_not=$(expr "$i" : '[^\!]*\!=\(.*\)')
+            actual=$(jq -r "$json_field" <<<"$output")
+            is_not "$actual" "$expect_not" "$testname : $json_field"
+        elif expr "$i" : "[^=~]\+=.*" >/dev/null; then
             # Exact match on json field
             json_field=$(expr "$i" : "\([^=]*\)=")
             expect=$(expr "$i" : '[^=]*=\(.*\)')
@@ -380,13 +463,26 @@ function start_service() {
         die "Cannot start service on non-localhost ($HOST)"
     fi
 
-    $PODMAN_BIN \
+    # FIXME: EXPERIMENTAL: 2022-06-13: podman rootless needs a namespace. If
+    # system-service is the first podman command run (as is the case in CI)
+    # this will happen as a fork-exec, where the parent podman creates the
+    # namespace and the child is the server. Then, when stop_service() kills
+    # the parent, the child (server) happily stays alive and ruins subsequent
+    # tests that try to restart service with different settings.
+    # Workaround: run an unshare to get namespaces initialized.
+    if [[ $(id -u) != 0 ]]; then
+        $PODMAN_BIN unshare true
+    fi
+
+    CONTAINERS_REGISTRIES_CONF=$TESTS_DIR/../registries.conf \
+        $PODMAN_BIN \
         --root $WORKDIR/server_root --syslog=true \
         system service \
         --time 0 \
         tcp:127.0.0.1:$PORT \
         &> $WORKDIR/server.log &
     service_pid=$!
+    echo "# started service, pid $service_pid"
 
     wait_for_port $HOST $PORT
 }
@@ -396,7 +492,14 @@ function stop_service() {
     if [[ -n $service_pid ]]; then
         kill $service_pid || :
         wait $service_pid || :
+        echo "# stopped service, pid $service_pid"
     fi
+    service_pid=
+
+    if { exec 3<> /dev/tcp/$HOST/$PORT; } &>/dev/null; then
+        echo "# WARNING: stop_service: Service still running on port $PORT"
+    fi
+
 }
 
 ####################
@@ -468,6 +571,7 @@ function start_registry() {
            ${REGISTRY_IMAGE}
 
     wait_for_port localhost $REGISTRY_PORT 10
+    echo "# started registry (auth=$auth) on port $PORT"
 }
 
 function stop_registry() {
@@ -482,6 +586,7 @@ function stop_registry() {
         if [[ "$1" = "--cleanup" ]]; then
             podman $OPTS rmi -f -a
         fi
+        echo "# stopped registry on port $PORT"
     fi
 
     REGISTRY_PORT=
@@ -598,11 +703,11 @@ echo -e "collected ${#tests_to_run[@]} items\n"
 
 start_service
 
-for i in ${tests_to_run[@]}; do
+for i in "${tests_to_run[@]}"; do
     TEST_CONTEXT="[$(basename $i .at)]"
 
     # Clear output from 'podman' helper
-    >| $WORKDIR/output.log
+    truncate --size=0 $WORKDIR/output.log
 
     source $i
 done

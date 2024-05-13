@@ -78,11 +78,15 @@ t GET networks?filters="{\"id\":[\"$network1_id\"]}" 200 \
   .[0].Name=network1 \
   .[0].Id=$network1_id
 # invalid filter
-t GET networks?filters='{"dangling":["1"]}' 500 \
-  .cause='invalid filter "dangling"'
+t GET networks?filters='{"dangling":["true","0"]}' 500 \
+  .cause="got more than one value for filter key \"dangling\""
 # (#9293 with no networks the endpoint should return empty array instead of null)
 t GET networks?filters='{"name":["doesnotexists"]}' 200 \
   "[]"
+
+# check default name in list endpoint
+t GET networks 200 \
+  .[].Name~.*bridge.*
 
 # network inspect docker
 t GET networks/$network1_id 200 \
@@ -90,8 +94,20 @@ t GET networks/$network1_id 200 \
   .Id=$network1_id \
   .Scope=local
 
+# inspect default bridge network
+t GET networks/bridge 200 \
+  .Name=bridge
+
+# inspect default bridge network with real podman name should return real name
+t GET networks/podman 200 \
+  .Name=podman
+
 # network create docker
 t POST networks/create Name=net3\ IPAM='{"Config":[]}' 201
+# Since Docker API 1.44, the server always checks for duplicate networks, even
+# when the deprecated CheckDuplicate parameter is set
+t POST networks/create Name=net3 409
+t POST networks/create Name=net3\ CheckDuplicate=false 409
 # network delete docker
 t DELETE networks/net3 204
 
@@ -176,6 +192,22 @@ t DELETE libpod/networks/macvlan1 200 \
   .[0].Name~macvlan1 \
   .[0].Err=null
 
+
+# create network with isolate option and make sure it is not shown in docker compat endpoint
+podman network create --opt isolate=true isolate-test
+# Note the order of both list calls is important to test for https://github.com/containers/podman/issues/22330
+# First call the compat endpoint, then the libpod one. Previously this would have removed
+# the internal option for the libpod endpoint as well.
+t GET networks?filters='{"name":["isolate-test"]}' 200 \
+  .[0].Name=isolate-test \
+  .[0].Options="{}"
+
+t GET libpod/networks/json?filters='{"name":["isolate-test"]}' 200 \
+  .[0].name=isolate-test \
+  .[0].options.isolate="true"
+
+t DELETE libpod/networks/isolate-test 200
+
 #
 # test networks with containers
 #
@@ -202,5 +234,27 @@ t GET networks/$nid 200 .Name="network5" \
   .Containers[\"$cid\"].IPv4Address=10.10.253.2/24
 # clean the network
 podman network rm -f network5
+
+#
+# Test connecting container to network when connection already exists
+#
+podman network create netcon
+podman create --network bridge --name c1 $IMAGE top
+
+# connect c1 to the network for the first time.
+t POST networks/netcon/connect Container=c1 200 OK
+# connect c1 to netcon again should not error
+t POST networks/netcon/connect Container=c1 200 OK
+
+# connect c1 to netcon here should error as the container is running and it is already connected
+podman start c1
+t POST networks/netcon/connect Container=c1 403 .cause="network is already connected"
+
+# connect c1 to netcon here should not error as container was stopped
+podman stop c1
+t POST networks/netcon/connect Container=c1 200 OK
+
+# cleanup
+podman network rm -f netcon
 
 # vim: filetype=sh

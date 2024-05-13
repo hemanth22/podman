@@ -1,14 +1,13 @@
-//go:build linux || freebsd
-// +build linux freebsd
+//go:build (linux || freebsd) && cni
 
 package cni
 
 import (
 	"net"
-	"os"
 	"path/filepath"
 
 	"github.com/containers/common/libnetwork/types"
+	"github.com/containers/storage/pkg/fileutils"
 )
 
 const (
@@ -26,6 +25,9 @@ const (
 
 	// podmanOptionsKey key used to store the podman network options in a cni config
 	podmanOptionsKey = "podman_options"
+
+	// ingressPolicySameBridge is used to only allow connection on the same bridge network
+	ingressPolicySameBridge = "same-bridge"
 )
 
 // cniPortMapEntry struct is used by the portmap plugin
@@ -95,8 +97,9 @@ type VLANConfig struct {
 
 // firewallConfig describes the firewall plugin
 type firewallConfig struct {
-	PluginType string `json:"type"`
-	Backend    string `json:"backend"`
+	PluginType    string `json:"type"`
+	Backend       string `json:"backend"`
+	IngressPolicy string `json:"ingressPolicy,omitempty"`
 }
 
 // tuningConfig describes the tuning plugin
@@ -112,7 +115,7 @@ type dnsNameConfig struct {
 }
 
 // ncList describes a generic map
-type ncList map[string]interface{}
+type ncList map[string]any
 
 // newNcList creates a generic map of values with string
 // keys and adds in version and network name
@@ -135,8 +138,6 @@ func newNcList(name, version string, labels, options map[string]string) ncList {
 
 // newHostLocalBridge creates a new LocalBridge for host-local
 func newHostLocalBridge(name string, isGateWay, ipMasq bool, mtu, vlan int, ipamConf *ipamConfig) *hostLocalBridge {
-	caps := make(map[string]bool)
-	caps["ips"] = true
 	bridge := hostLocalBridge{
 		PluginType:  "bridge",
 		BrName:      name,
@@ -150,7 +151,7 @@ func newHostLocalBridge(name string, isGateWay, ipMasq bool, mtu, vlan int, ipam
 		bridge.IPAM = *ipamConf
 		// if we use host-local set the ips cap to ensure we can set static ips via runtime config
 		if ipamConf.PluginType == types.HostLocalIPAMDriver {
-			bridge.Capabilities = caps
+			bridge.Capabilities = map[string]bool{"ips": true}
 		}
 	}
 	return &bridge
@@ -212,20 +213,21 @@ func newIPAMDefaultRoute(isIPv6 bool) (ipamRoute, error) {
 // newPortMapPlugin creates a predefined, default portmapping
 // configuration
 func newPortMapPlugin() portMapConfig {
-	caps := make(map[string]bool)
-	caps["portMappings"] = true
-	p := portMapConfig{
+	return portMapConfig{
 		PluginType:   "portmap",
-		Capabilities: caps,
+		Capabilities: map[string]bool{"portMappings": true},
 	}
-	return p
 }
 
 // newFirewallPlugin creates a generic firewall plugin
-func newFirewallPlugin() firewallConfig {
-	return firewallConfig{
+func newFirewallPlugin(isolate bool) firewallConfig {
+	fw := firewallConfig{
 		PluginType: "firewall",
 	}
+	if isolate {
+		fw.IngressPolicy = ingressPolicySameBridge
+	}
+	return fw
 }
 
 // newTuningPlugin creates a generic tuning section
@@ -238,19 +240,17 @@ func newTuningPlugin() tuningConfig {
 // newDNSNamePlugin creates the dnsname config with a given
 // domainname
 func newDNSNamePlugin(domainName string) dnsNameConfig {
-	caps := make(map[string]bool, 1)
-	caps["aliases"] = true
 	return dnsNameConfig{
 		PluginType:   "dnsname",
 		DomainName:   domainName,
-		Capabilities: caps,
+		Capabilities: map[string]bool{"aliases": true},
 	}
 }
 
 // hasDNSNamePlugin looks to see if the dnsname cni plugin is present
 func hasDNSNamePlugin(paths []string) bool {
 	for _, p := range paths {
-		if _, err := os.Stat(filepath.Join(p, "dnsname")); err == nil {
+		if err := fileutils.Exists(filepath.Join(p, "dnsname")); err == nil {
 			return true
 		}
 	}
@@ -279,7 +279,7 @@ func newVLANPlugin(pluginType, device, mode string, mtu int, ipam *ipamConfig) V
 	caps := make(map[string]bool)
 	caps["ips"] = true
 	// if we use host-local set the ips cap to ensure we can set static ips via runtime config
-	if ipam.PluginType == types.HostLocalIPAMDriver {
+	if m.IPAM.PluginType == types.HostLocalIPAMDriver {
 		m.Capabilities = caps
 	}
 	return m

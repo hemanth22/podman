@@ -1,4 +1,4 @@
-% podman-system-connection-remove(1)
+% podman-system-connection-remove 1
 
 ## NAME
 podman\-system\-connection\-remove - Delete named destination
@@ -11,11 +11,13 @@ Delete named ssh destination.
 
 ## OPTIONS
 
-#### **--all**=*false*, **-a**
+#### **--all**, **-a**
 
 Remove all connections.
 
 ## EXAMPLE
+
+Remove the specified system connection:
 ```
 $ podman system connection remove production
 ```

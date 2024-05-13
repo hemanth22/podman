@@ -2,16 +2,16 @@ package volumes
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/containers/common/pkg/completion"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -34,7 +34,7 @@ var (
 
 var (
 	rmOptions   = entities.VolumeRmOptions{}
-	stopTimeout uint
+	stopTimeout int
 )
 
 func init() {
@@ -46,7 +46,7 @@ func init() {
 	flags.BoolVarP(&rmOptions.All, "all", "a", false, "Remove all volumes")
 	flags.BoolVarP(&rmOptions.Force, "force", "f", false, "Remove a volume by force, even if it is being used by a container")
 	timeFlagName := "time"
-	flags.UintVarP(&stopTimeout, timeFlagName, "t", containerConfig.Engine.StopTimeout, "Seconds to wait for running containers to stop before killing the container")
+	flags.IntVarP(&stopTimeout, timeFlagName, "t", int(containerConfig.Engine.StopTimeout), "Seconds to wait for running containers to stop before killing the container")
 	_ = rmCommand.RegisterFlagCompletionFunc(timeFlagName, completion.AutocompleteNone)
 }
 
@@ -61,10 +61,14 @@ func rm(cmd *cobra.Command, args []string) error {
 		if !rmOptions.Force {
 			return errors.New("--force option must be specified to use the --time option")
 		}
-		rmOptions.Timeout = &stopTimeout
+		timeout := uint(stopTimeout)
+		rmOptions.Timeout = &timeout
 	}
 	responses, err := registry.ContainerEngine().VolumeRm(context.Background(), args, rmOptions)
 	if err != nil {
+		if rmOptions.Force && strings.Contains(err.Error(), define.ErrNoSuchVolume.Error()) {
+			return nil
+		}
 		setExitCode(err)
 		return err
 	}
@@ -72,6 +76,9 @@ func rm(cmd *cobra.Command, args []string) error {
 		if r.Err == nil {
 			fmt.Println(r.Id)
 		} else {
+			if rmOptions.Force && strings.Contains(r.Err.Error(), define.ErrNoSuchVolume.Error()) {
+				continue
+			}
 			setExitCode(r.Err)
 			errs = append(errs, r.Err)
 		}
@@ -80,15 +87,9 @@ func rm(cmd *cobra.Command, args []string) error {
 }
 
 func setExitCode(err error) {
-	cause := errors.Cause(err)
-	switch {
-	case cause == define.ErrNoSuchVolume:
+	if errors.Is(err, define.ErrNoSuchVolume) || strings.Contains(err.Error(), define.ErrNoSuchVolume.Error()) {
 		registry.SetExitCode(1)
-	case strings.Contains(cause.Error(), define.ErrNoSuchVolume.Error()):
-		registry.SetExitCode(1)
-	case cause == define.ErrVolumeBeingUsed:
-		registry.SetExitCode(2)
-	case strings.Contains(cause.Error(), define.ErrVolumeBeingUsed.Error()):
+	} else if errors.Is(err, define.ErrVolumeBeingUsed) || strings.Contains(err.Error(), define.ErrVolumeBeingUsed.Error()) {
 		registry.SetExitCode(2)
 	}
 }

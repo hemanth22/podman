@@ -1,4 +1,3 @@
-//go:build (!amd64 && !arm64) || windows
-// +build !amd64,!arm64 windows
+//go:build !amd64 && !arm64 && darwin
 
 package qemu

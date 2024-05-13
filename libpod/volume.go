@@ -1,12 +1,14 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"time"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/lock"
-	"github.com/containers/podman/v4/libpod/plugin"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/lock"
+	"github.com/containers/podman/v5/libpod/plugin"
+	"github.com/containers/storage/pkg/directory"
 )
 
 // Volume is a libpod named volume.
@@ -17,10 +19,11 @@ type Volume struct {
 	config *VolumeConfig
 	state  *VolumeState
 
-	valid   bool
-	plugin  *plugin.VolumePlugin
-	runtime *Runtime
-	lock    lock.Locker
+	ignoreIfExists bool
+	valid          bool
+	plugin         *plugin.VolumePlugin
+	runtime        *Runtime
+	lock           lock.Locker
 }
 
 // VolumeConfig holds the volume's immutable configuration.
@@ -55,6 +58,19 @@ type VolumeConfig struct {
 	// DisableQuota indicates that the volume should completely disable using any
 	// quota tracking.
 	DisableQuota bool `json:"disableQuota,omitempty"`
+	// Timeout allows users to override the default driver timeout of 5 seconds
+	Timeout *uint `json:"timeout,omitempty"`
+	// StorageName is the name of the volume in c/storage. Only used for
+	// image volumes.
+	StorageName string `json:"storageName,omitempty"`
+	// StorageID is the ID of the volume in c/storage. Only used for image
+	// volumes.
+	StorageID string `json:"storageID,omitempty"`
+	// StorageImageID is the ID of the image the volume was based off of.
+	// Only used for image volumes.
+	StorageImageID string `json:"storageImageID,omitempty"`
+	// MountLabel is the SELinux label to assign to mount points
+	MountLabel string `json:"mountlabel,omitempty"`
 }
 
 // VolumeState holds the volume's mutable state.
@@ -95,7 +111,8 @@ func (v *Volume) Name() string {
 
 // Returns the size on disk of volume
 func (v *Volume) Size() (uint64, error) {
-	return util.SizeOfPath(v.config.MountPoint)
+	size, err := directory.Size(v.config.MountPoint)
+	return uint64(size), err
 }
 
 // Driver retrieves the volume's driver.
@@ -122,7 +139,7 @@ func (v *Volume) Labels() map[string]string {
 // MountPoint returns the volume's mountpoint on the host
 func (v *Volume) MountPoint() (string, error) {
 	// For the sake of performance, avoid locking unless we have to.
-	if v.UsesVolumeDriver() {
+	if v.UsesVolumeDriver() || v.config.Driver == define.VolumeDriverImage {
 		v.lock.Lock()
 		defer v.lock.Unlock()
 
@@ -147,7 +164,7 @@ func (v *Volume) MountCount() (uint, error) {
 
 // Internal-only helper for volume mountpoint
 func (v *Volume) mountPoint() string {
-	if v.UsesVolumeDriver() {
+	if v.UsesVolumeDriver() || v.config.Driver == define.VolumeDriverImage {
 		return v.state.MountPoint
 	}
 
@@ -248,6 +265,12 @@ func (v *Volume) IsDangling() (bool, error) {
 // drivers are pluggable backends for volumes that will manage the storage and
 // mounting.
 func (v *Volume) UsesVolumeDriver() bool {
+	if v.config.Driver == define.VolumeDriverImage {
+		if _, ok := v.runtime.config.Engine.VolumePlugins[v.config.Driver]; ok {
+			return true
+		}
+		return false
+	}
 	return !(v.config.Driver == define.VolumeDriverLocal || v.config.Driver == "")
 }
 
@@ -262,4 +285,8 @@ func (v *Volume) Unmount() error {
 	v.lock.Lock()
 	defer v.lock.Unlock()
 	return v.unmount(false)
+}
+
+func (v *Volume) NeedsMount() bool {
+	return v.needsMount()
 }

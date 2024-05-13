@@ -1,22 +1,20 @@
-//go:build linux && !remote
-// +build linux,!remote
+//go:build (linux || freebsd) && !remote
 
 package system
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	api "github.com/containers/podman/v4/pkg/api/server"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/infra"
-	"github.com/containers/podman/v4/pkg/servicereaper"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	api "github.com/containers/podman/v5/pkg/api/server"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra"
 	"github.com/coreos/go-systemd/v22/activation"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"golang.org/x/sys/unix"
@@ -46,11 +44,15 @@ func restService(flags *pflag.FlagSet, cfg *entities.PodmanConfig, opts entities
 			return fmt.Errorf("wrong number of file descriptors for socket activation protocol (%d != 1)", len(listeners))
 		}
 		listener = listeners[0]
+		// note that activation.Listeners() returns nil when it cannot listen on the fd (i.e. udp connection)
+		if listener == nil {
+			return errors.New("unexpected fd received from systemd: cannot listen on it")
+		}
 		libpodRuntime.SetRemoteURI(listeners[0].Addr().String())
 	} else {
 		uri, err := url.Parse(opts.URI)
 		if err != nil {
-			return errors.Errorf("%s is an invalid socket destination", opts.URI)
+			return fmt.Errorf("%s is an invalid socket destination", opts.URI)
 		}
 
 		switch uri.Scheme {
@@ -70,10 +72,16 @@ func restService(flags *pflag.FlagSet, cfg *entities.PodmanConfig, opts entities
 			} else {
 				listener, err = net.Listen(uri.Scheme, path)
 				if err != nil {
-					return errors.Wrapf(err, "unable to create socket")
+					return fmt.Errorf("unable to create socket: %w", err)
 				}
 			}
 		case "tcp":
+			// We want to check if the user is requesting a TCP address.
+			// If so, warn that this is insecure.
+			// Ignore errors here, the actual backend code will handle them
+			// better than we can here.
+			logrus.Warnf("Using the Podman API service with TCP sockets is not recommended, please see `podman system service` manpage for details")
+
 			host := uri.Host
 			if host == "" {
 				// For backward compatibility, support "tcp:<host>:<port>" and "tcp://<host>:<port>"
@@ -81,25 +89,41 @@ func restService(flags *pflag.FlagSet, cfg *entities.PodmanConfig, opts entities
 			}
 			listener, err = net.Listen(uri.Scheme, host)
 			if err != nil {
-				return errors.Wrapf(err, "unable to create socket %v", host)
+				return fmt.Errorf("unable to create socket %v: %w", host, err)
 			}
 		default:
-			logrus.Debugf("Attempting API Service endpoint scheme %q", uri.Scheme)
+			return fmt.Errorf("API Service endpoint scheme %q is not supported. Try tcp://%s or unix://%s", uri.Scheme, opts.URI, opts.URI)
 		}
 		libpodRuntime.SetRemoteURI(uri.String())
 	}
 
-	// Close stdin, so shortnames will not prompt
+	// bugzilla.redhat.com/show_bug.cgi?id=2180483:
+	//
+	// Disable leaking the LISTEN_* into containers which
+	// are observed to be passed by systemd even without
+	// being socket activated as described in
+	// https://access.redhat.com/solutions/6512011.
+	for _, val := range []string{"LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"} {
+		if err := os.Unsetenv(val); err != nil {
+			return fmt.Errorf("unsetting %s: %v", val, err)
+		}
+	}
+
+	// Set stdin to /dev/null, so shortnames will not prompt
 	devNullfile, err := os.Open(os.DevNull)
 	if err != nil {
 		return err
 	}
-	defer devNullfile.Close()
 	if err := unix.Dup2(int(devNullfile.Fd()), int(os.Stdin.Fd())); err != nil {
+		devNullfile.Close()
 		return err
 	}
+	// Close the fd right away to not leak it during the entire time of the service.
+	devNullfile.Close()
 
-	servicereaper.Start()
+	maybeMoveToSubCgroup()
+
+	maybeStartServiceReaper()
 	infra.StartWatcher(libpodRuntime)
 	server, err := api.NewServerWithSettings(libpodRuntime, listener, opts)
 	if err != nil {

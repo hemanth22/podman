@@ -1,20 +1,25 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/pkg/signal"
+	"github.com/containers/common/pkg/resize"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/pkg/signal"
 	"github.com/containers/storage/pkg/archive"
-	"github.com/pkg/errors"
+	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // Init creates a container in the OCI runtime, moving a container from
@@ -38,7 +43,7 @@ func (c *Container) Init(ctx context.Context, recursive bool) error {
 	}
 
 	if !c.ensureState(define.ContainerStateConfigured, define.ContainerStateStopped, define.ContainerStateExited) {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "container %s has already been created in runtime", c.ID())
+		return fmt.Errorf("container %s has already been created in runtime: %w", c.ID(), define.ErrCtrStateInvalid)
 	}
 
 	if !recursive {
@@ -76,10 +81,27 @@ func (c *Container) Init(ctx context.Context, recursive bool) error {
 // ContainerStatePaused via Pause(), or to ContainerStateStopped by the process
 // stopping (either due to exit, or being forced to stop by the Kill or Stop API
 // calls).
-// Start requites that all dependency containers (e.g. pod infra containers) be
-// running before being run. The recursive parameter, if set, will start all
+// Start requires that all dependency containers (e.g. pod infra containers) are
+// running before starting the container. The recursive parameter, if set, will start all
 // dependencies before starting this container.
-func (c *Container) Start(ctx context.Context, recursive bool) error {
+func (c *Container) Start(ctx context.Context, recursive bool) (finalErr error) {
+	defer func() {
+		if finalErr != nil {
+			// Have to re-lock.
+			// As this is the first defer, it's the last thing to
+			// happen in the function - so `defer c.lock.Unlock()`
+			// below already fired.
+			if !c.batched {
+				c.lock.Lock()
+				defer c.lock.Unlock()
+			}
+
+			if err := saveContainerError(c, finalErr); err != nil {
+				logrus.Debug(err)
+			}
+		}
+	}()
+
 	if !c.batched {
 		c.lock.Lock()
 		defer c.lock.Unlock()
@@ -93,7 +115,28 @@ func (c *Container) Start(ctx context.Context, recursive bool) error {
 	}
 
 	// Start the container
-	return c.start()
+	return c.start(ctx)
+}
+
+// Update updates the given container.
+// Either resource limits or restart policy can be updated.
+// Either resourcs or restartPolicy must not be nil.
+// If restartRetries is not nil, restartPolicy must be set and must be "on-failure".
+func (c *Container) Update(resources *spec.LinuxResources, restartPolicy *string, restartRetries *uint) error {
+	if !c.batched {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+
+		if err := c.syncContainer(); err != nil {
+			return err
+		}
+	}
+
+	if c.ensureState(define.ContainerStateRemoving) {
+		return fmt.Errorf("container %s is being removed, cannot update: %w", c.ID(), define.ErrCtrStateInvalid)
+	}
+
+	return c.update(resources, restartPolicy, restartRetries)
 }
 
 // StartAndAttach starts a container and attaches to it.
@@ -102,7 +145,24 @@ func (c *Container) Start(ctx context.Context, recursive bool) error {
 // Attach call occurs before Start).
 // In overall functionality, it is identical to the Start call, with the added
 // side effect that an attach session will also be started.
-func (c *Container) StartAndAttach(ctx context.Context, streams *define.AttachStreams, keys string, resize <-chan define.TerminalSize, recursive bool) (<-chan error, error) {
+func (c *Container) StartAndAttach(ctx context.Context, streams *define.AttachStreams, keys string, resize <-chan resize.TerminalSize, recursive bool) (retChan <-chan error, finalErr error) {
+	defer func() {
+		if finalErr != nil {
+			// Have to re-lock.
+			// As this is the first defer, it's the last thing to
+			// happen in the function - so `defer c.lock.Unlock()`
+			// below already fired.
+			if !c.batched {
+				c.lock.Lock()
+				defer c.lock.Unlock()
+			}
+
+			if err := saveContainerError(c, finalErr); err != nil {
+				logrus.Debug(err)
+			}
+		}
+	}()
+
 	if !c.batched {
 		c.lock.Lock()
 		defer c.lock.Unlock()
@@ -124,7 +184,7 @@ func (c *Container) StartAndAttach(ctx context.Context, streams *define.AttachSt
 	// Attach to the container before starting it
 	go func() {
 		// Start resizing
-		if c.LogDriver() != define.PassthroughLogging {
+		if c.LogDriver() != define.PassthroughLogging && c.LogDriver() != define.PassthroughTTYLogging {
 			registerResizeFunc(resize, c.bundlePath())
 		}
 
@@ -181,7 +241,24 @@ func (c *Container) Stop() error {
 // StopWithTimeout is a version of Stop that allows a timeout to be specified
 // manually. If timeout is 0, SIGKILL will be used immediately to kill the
 // container.
-func (c *Container) StopWithTimeout(timeout uint) error {
+func (c *Container) StopWithTimeout(timeout uint) (finalErr error) {
+	defer func() {
+		if finalErr != nil {
+			// Have to re-lock.
+			// As this is the first defer, it's the last thing to
+			// happen in the function - so `defer c.lock.Unlock()`
+			// below already fired.
+			if !c.batched {
+				c.lock.Lock()
+				defer c.lock.Unlock()
+			}
+
+			if err := saveContainerError(c, finalErr); err != nil {
+				logrus.Debug(err)
+			}
+		}
+	}()
+
 	if !c.batched {
 		c.lock.Lock()
 		defer c.lock.Unlock()
@@ -189,14 +266,6 @@ func (c *Container) StopWithTimeout(timeout uint) error {
 		if err := c.syncContainer(); err != nil {
 			return err
 		}
-	}
-
-	if c.ensureState(define.ContainerStateStopped, define.ContainerStateExited) {
-		return define.ErrCtrStopped
-	}
-
-	if !c.ensureState(define.ContainerStateCreated, define.ContainerStateRunning, define.ContainerStateStopping) {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "can only stop created or running containers. %s is in state %s", c.ID(), c.state.State.String())
 	}
 
 	return c.stop(timeout)
@@ -220,7 +289,7 @@ func (c *Container) Kill(signal uint) error {
 		// stop the container and if that is taking too long, a user
 		// may have decided to kill the container after all.
 	default:
-		return errors.Wrapf(define.ErrCtrStateInvalid, "can only kill running containers. %s is in state %s", c.ID(), c.state.State.String())
+		return fmt.Errorf("can only kill running containers. %s is in state %s: %w", c.ID(), c.state.State.String(), define.ErrCtrStateInvalid)
 	}
 
 	// Hardcode all = false, we only use all when removing.
@@ -232,15 +301,23 @@ func (c *Container) Kill(signal uint) error {
 
 	c.newContainerEvent(events.Kill)
 
+	// Make sure to wait for the container to exit in case of SIGKILL.
+	if signal == uint(unix.SIGKILL) {
+		return c.waitForConmonToExitAndSave()
+	}
+
 	return c.save()
 }
 
 // Attach attaches to a container.
 // This function returns when the attach finishes. It does not hold the lock for
 // the duration of its runtime, only using it at the beginning to verify state.
-func (c *Container) Attach(streams *define.AttachStreams, keys string, resize <-chan define.TerminalSize) error {
+func (c *Container) Attach(streams *define.AttachStreams, keys string, resize <-chan resize.TerminalSize) error {
 	if c.LogDriver() == define.PassthroughLogging {
-		return errors.Wrapf(define.ErrNoLogs, "this container is using the 'passthrough' log driver, cannot attach")
+		return fmt.Errorf("this container is using the 'passthrough' log driver, cannot attach: %w", define.ErrNoLogs)
+	}
+	if c.LogDriver() == define.PassthroughTTYLogging {
+		return fmt.Errorf("this container is using the 'passthrough-tty' log driver, cannot attach: %w", define.ErrNoLogs)
 	}
 	if !c.batched {
 		c.lock.Lock()
@@ -253,7 +330,7 @@ func (c *Container) Attach(streams *define.AttachStreams, keys string, resize <-
 	}
 
 	if !c.ensureState(define.ContainerStateCreated, define.ContainerStateRunning) {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "can only attach to created or running containers")
+		return fmt.Errorf("can only attach to created or running containers: %w", define.ErrCtrStateInvalid)
 	}
 
 	// HACK: This is really gross, but there isn't a better way without
@@ -262,9 +339,11 @@ func (c *Container) Attach(streams *define.AttachStreams, keys string, resize <-
 	// Send a SIGWINCH after attach succeeds so that most programs will
 	// redraw the screen for the new attach session.
 	attachRdy := make(chan bool, 1)
-	if c.config.Spec.Process != nil && c.config.Spec.Process.Terminal {
+	if c.Terminal() {
 		go func() {
 			<-attachRdy
+			c.lock.Lock()
+			defer c.lock.Unlock()
 			if err := c.ociRuntime.KillContainer(c, uint(signal.SIGWINCH), false); err != nil {
 				logrus.Warnf("Unable to send SIGWINCH to container %s after attach: %v", c.ID(), err)
 			}
@@ -272,7 +351,7 @@ func (c *Container) Attach(streams *define.AttachStreams, keys string, resize <-
 	}
 
 	// Start resizing
-	if c.LogDriver() != define.PassthroughLogging {
+	if c.LogDriver() != define.PassthroughLogging && c.LogDriver() != define.PassthroughTTYLogging {
 		registerResizeFunc(resize, c.bundlePath())
 	}
 
@@ -319,11 +398,11 @@ func (c *Container) HTTPAttach(r *http.Request, w http.ResponseWriter, streams *
 	}
 
 	if !c.ensureState(define.ContainerStateCreated, define.ContainerStateRunning) {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "can only attach to created or running containers")
+		return fmt.Errorf("can only attach to created or running containers: %w", define.ErrCtrStateInvalid)
 	}
 
 	if !streamAttach && !streamLogs {
-		return errors.Wrapf(define.ErrInvalidArg, "must specify at least one of stream or logs")
+		return fmt.Errorf("must specify at least one of stream or logs: %w", define.ErrInvalidArg)
 	}
 
 	logrus.Infof("Performing HTTP Hijack attach to container %s", c.ID())
@@ -334,7 +413,7 @@ func (c *Container) HTTPAttach(r *http.Request, w http.ResponseWriter, streams *
 
 // AttachResize resizes the container's terminal, which is displayed by Attach
 // and HTTPAttach.
-func (c *Container) AttachResize(newSize define.TerminalSize) error {
+func (c *Container) AttachResize(newSize resize.TerminalSize) error {
 	if !c.batched {
 		c.lock.Lock()
 		defer c.lock.Unlock()
@@ -345,7 +424,7 @@ func (c *Container) AttachResize(newSize define.TerminalSize) error {
 	}
 
 	if !c.ensureState(define.ContainerStateCreated, define.ContainerStateRunning) {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "can only resize created or running containers")
+		return fmt.Errorf("can only resize created or running containers: %w", define.ErrCtrStateInvalid)
 	}
 
 	logrus.Infof("Resizing TTY of container %s", c.ID())
@@ -382,20 +461,20 @@ func (c *Container) Unmount(force bool) error {
 	if c.state.Mounted {
 		mounted, err := c.runtime.storageService.MountedContainerImage(c.ID())
 		if err != nil {
-			return errors.Wrapf(err, "can't determine how many times %s is mounted, refusing to unmount", c.ID())
+			return fmt.Errorf("can't determine how many times %s is mounted, refusing to unmount: %w", c.ID(), err)
 		}
 		if mounted == 1 {
 			if c.ensureState(define.ContainerStateRunning, define.ContainerStatePaused) {
-				return errors.Wrapf(define.ErrCtrStateInvalid, "cannot unmount storage for container %s as it is running or paused", c.ID())
+				return fmt.Errorf("cannot unmount storage for container %s as it is running or paused: %w", c.ID(), define.ErrCtrStateInvalid)
 			}
 			execSessions, err := c.getActiveExecSessions()
 			if err != nil {
 				return err
 			}
 			if len(execSessions) != 0 {
-				return errors.Wrapf(define.ErrCtrStateInvalid, "container %s has active exec sessions, refusing to unmount", c.ID())
+				return fmt.Errorf("container %s has active exec sessions, refusing to unmount: %w", c.ID(), define.ErrCtrStateInvalid)
 			}
-			return errors.Wrapf(define.ErrInternal, "can't unmount %s last mount, it is still in use", c.ID())
+			return fmt.Errorf("can't unmount %s last mount, it is still in use: %w", c.ID(), define.ErrInternal)
 		}
 	}
 	defer c.newContainerEvent(events.Unmount)
@@ -414,10 +493,10 @@ func (c *Container) Pause() error {
 	}
 
 	if c.state.State == define.ContainerStatePaused {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "%q is already paused", c.ID())
+		return fmt.Errorf("%q is already paused: %w", c.ID(), define.ErrCtrStateInvalid)
 	}
 	if c.state.State != define.ContainerStateRunning {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "%q is not running, can't pause", c.state.State)
+		return fmt.Errorf("%q is not running, can't pause: %w", c.state.State, define.ErrCtrStateInvalid)
 	}
 	defer c.newContainerEvent(events.Pause)
 	return c.pause()
@@ -435,7 +514,7 @@ func (c *Container) Unpause() error {
 	}
 
 	if c.state.State != define.ContainerStatePaused {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "%q is not paused, can't unpause", c.ID())
+		return fmt.Errorf("%q is not paused, can't unpause: %w", c.ID(), define.ErrCtrStateInvalid)
 	}
 	defer c.newContainerEvent(events.Unpause)
 	return c.unpause()
@@ -443,7 +522,7 @@ func (c *Container) Unpause() error {
 
 // Export exports a container's root filesystem as a tar archive
 // The archive will be saved as a file at the given path
-func (c *Container) Export(path string) error {
+func (c *Container) Export(out io.Writer) error {
 	if !c.batched {
 		c.lock.Lock()
 		defer c.lock.Unlock()
@@ -454,11 +533,11 @@ func (c *Container) Export(path string) error {
 	}
 
 	if c.state.State == define.ContainerStateRemoving {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "cannot mount container %s as it is being removed", c.ID())
+		return fmt.Errorf("cannot mount container %s as it is being removed: %w", c.ID(), define.ErrCtrStateInvalid)
 	}
 
 	defer c.newContainerEvent(events.Mount)
-	return c.export(path)
+	return c.export(out)
 }
 
 // AddArtifact creates and writes to an artifact file for the container
@@ -467,7 +546,7 @@ func (c *Container) AddArtifact(name string, data []byte) error {
 		return define.ErrCtrRemoved
 	}
 
-	return ioutil.WriteFile(c.getArtifactPath(name), data, 0o740)
+	return os.WriteFile(c.getArtifactPath(name), data, 0o740)
 }
 
 // GetArtifact reads the specified artifact file from the container
@@ -476,7 +555,7 @@ func (c *Container) GetArtifact(name string) ([]byte, error) {
 		return nil, define.ErrCtrRemoved
 	}
 
-	return ioutil.ReadFile(c.getArtifactPath(name))
+	return os.ReadFile(c.getArtifactPath(name))
 }
 
 // RemoveArtifact deletes the specified artifacts file
@@ -490,41 +569,128 @@ func (c *Container) RemoveArtifact(name string) error {
 
 // Wait blocks until the container exits and returns its exit code.
 func (c *Container) Wait(ctx context.Context) (int32, error) {
-	return c.WaitWithInterval(ctx, DefaultWaitInterval)
+	return c.WaitForExit(ctx, DefaultWaitInterval)
 }
 
-// WaitWithInterval blocks until the container to exit and returns its exit
-// code. The argument is the interval at which checks the container's status.
-func (c *Container) WaitWithInterval(ctx context.Context, waitTimeout time.Duration) (int32, error) {
+// WaitForExit blocks until the container exits and returns its exit code. The
+// argument is the interval at which checks the container's status.
+func (c *Container) WaitForExit(ctx context.Context, pollInterval time.Duration) (int32, error) {
 	if !c.valid {
 		return -1, define.ErrCtrRemoved
 	}
 
-	exitFile, err := c.exitFilePath()
-	if err != nil {
-		return -1, err
+	id := c.ID()
+	var conmonTimer time.Timer
+	conmonTimerSet := false
+
+	conmonPidFd := c.getConmonPidFd()
+	if conmonPidFd != -1 {
+		defer unix.Close(conmonPidFd)
 	}
-	chWait := make(chan error, 1)
+	conmonPidFdTriggered := false
 
-	go func() {
-		<-ctx.Done()
-		chWait <- define.ErrCanceled
-	}()
-
-	for {
-		// ignore errors here (with exception of cancellation), it is only used to avoid waiting
-		// too long.
-		_, e := WaitForFile(exitFile, chWait, waitTimeout)
-		if e == define.ErrCanceled {
-			return -1, define.ErrCanceled
+	getExitCode := func() (bool, int32, error) {
+		containerRemoved := false
+		if !c.batched {
+			c.lock.Lock()
+			defer c.lock.Unlock()
 		}
 
-		stopped, code, err := c.isStopped()
+		if err := c.syncContainer(); err != nil {
+			if !errors.Is(err, define.ErrNoSuchCtr) {
+				return false, -1, err
+			}
+			containerRemoved = true
+		}
+
+		// If conmon is not alive anymore set a timer to make sure
+		// we're returning even if conmon has forcefully been killed.
+		if !conmonTimerSet && !containerRemoved {
+			conmonAlive, err := c.ociRuntime.CheckConmonRunning(c)
+			switch {
+			case errors.Is(err, define.ErrNoSuchCtr):
+				// Container has been removed, so we assume the
+				// exit code is present in the DB.
+				containerRemoved = true
+			case err != nil:
+				return false, -1, err
+			case !conmonAlive:
+				// Give the exit code at most 20 seconds to
+				// show up in the DB.  That should largely be
+				// enough for the cleanup process.
+				timerDuration := time.Second * 20
+				conmonTimer = *time.NewTimer(timerDuration)
+				conmonTimerSet = true
+			case conmonAlive:
+				// Continue waiting if conmon's still running.
+				return false, -1, nil
+			}
+		}
+
+		timedout := ""
+		if !containerRemoved {
+			// If conmon is dead for more than $timerDuration or if the
+			// container has exited properly, try to look up the exit code.
+			select {
+			case <-conmonTimer.C:
+				logrus.Debugf("Exceeded conmon timeout waiting for container %s to exit", id)
+				timedout = " [exceeded conmon timeout waiting for container to exit]"
+			default:
+				switch c.state.State {
+				case define.ContainerStateExited, define.ContainerStateConfigured:
+					// Container exited, so we can look up the exit code.
+				case define.ContainerStateStopped:
+					// Continue looping unless the restart policy is always.
+					// In this case, the container would never transition to
+					// the exited state, so we need to look up the exit code.
+					if c.config.RestartPolicy != define.RestartPolicyAlways {
+						return false, -1, nil
+					}
+				default:
+					// Continue looping
+					return false, -1, nil
+				}
+			}
+		}
+
+		exitCode, err := c.runtime.state.GetContainerExitCode(id)
+		if err != nil {
+			if errors.Is(err, define.ErrNoSuchExitCode) {
+				// If the container is configured or created, we must assume it never ran.
+				if c.ensureState(define.ContainerStateConfigured, define.ContainerStateCreated) {
+					return true, 0, nil
+				}
+			}
+			return true, -1, fmt.Errorf("%w (container in state %s)%s", err, c.state.State, timedout)
+		}
+
+		return true, exitCode, nil
+	}
+
+	for {
+		hasExited, exitCode, err := getExitCode()
+		if hasExited {
+			return exitCode, err
+		}
 		if err != nil {
 			return -1, err
 		}
-		if stopped {
-			return code, nil
+		select {
+		case <-ctx.Done():
+			return -1, fmt.Errorf("waiting for exit code of container %s canceled", id)
+		default:
+			if conmonPidFd != -1 && !conmonPidFdTriggered {
+				// If possible (pidfd works), the first cycle we block until conmon dies
+				// If this happens, and we fall back to the old poll delay
+				// There is a deadlock in the cleanup code for "play kube" which causes
+				// conmon to not exit, so unfortunately we have to use the poll interval
+				// timeout here to avoid hanging.
+				fds := []unix.PollFd{{Fd: int32(conmonPidFd), Events: unix.POLLIN}}
+				_, _ = unix.Poll(fds, int(pollInterval.Milliseconds()))
+				conmonPidFdTriggered = true
+			} else {
+				time.Sleep(pollInterval)
+			}
 		}
 	}
 }
@@ -534,7 +700,7 @@ type waitResult struct {
 	err  error
 }
 
-func (c *Container) WaitForConditionWithInterval(ctx context.Context, waitTimeout time.Duration, conditions ...define.ContainerStatus) (int32, error) {
+func (c *Container) WaitForConditionWithInterval(ctx context.Context, waitTimeout time.Duration, conditions ...string) (int32, error) {
 	if !c.valid {
 		return -1, define.ErrCtrRemoved
 	}
@@ -549,13 +715,27 @@ func (c *Container) WaitForConditionWithInterval(ctx context.Context, waitTimeou
 	resultChan := make(chan waitResult)
 	waitForExit := false
 	wantedStates := make(map[define.ContainerStatus]bool, len(conditions))
+	wantedHealthStates := make(map[string]bool)
 
-	for _, condition := range conditions {
-		if condition == define.ContainerStateStopped || condition == define.ContainerStateExited {
-			waitForExit = true
-			continue
+	for _, rawCondition := range conditions {
+		switch rawCondition {
+		case define.HealthCheckHealthy, define.HealthCheckUnhealthy:
+			if !c.HasHealthCheck() {
+				return -1, fmt.Errorf("cannot use condition %q: container %s has no healthcheck", rawCondition, c.ID())
+			}
+			wantedHealthStates[rawCondition] = true
+		default:
+			condition, err := define.StringToContainerStatus(rawCondition)
+			if err != nil {
+				return -1, err
+			}
+			switch condition {
+			case define.ContainerStateExited, define.ContainerStateStopped:
+				waitForExit = true
+			default:
+				wantedStates[condition] = true
+			}
 		}
-		wantedStates[condition] = true
 	}
 
 	trySend := func(code int32, err error) {
@@ -572,25 +752,38 @@ func (c *Container) WaitForConditionWithInterval(ctx context.Context, waitTimeou
 		go func() {
 			defer wg.Done()
 
-			code, err := c.WaitWithInterval(ctx, waitTimeout)
+			code, err := c.WaitForExit(ctx, waitTimeout)
 			trySend(code, err)
 		}()
 	}
 
-	if len(wantedStates) > 0 {
+	if len(wantedStates) > 0 || len(wantedHealthStates) > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
 			for {
-				state, err := c.State()
-				if err != nil {
-					trySend(-1, err)
-					return
+				if len(wantedStates) > 0 {
+					state, err := c.State()
+					if err != nil {
+						trySend(-1, err)
+						return
+					}
+					if _, found := wantedStates[state]; found {
+						trySend(-1, nil)
+						return
+					}
 				}
-				if _, found := wantedStates[state]; found {
-					trySend(-1, nil)
-					return
+				if len(wantedHealthStates) > 0 {
+					status, err := c.HealthCheckStatus()
+					if err != nil {
+						trySend(-1, err)
+						return
+					}
+					if _, found := wantedHealthStates[status]; found {
+						trySend(-1, nil)
+						return
+					}
 				}
 				select {
 				case <-ctx.Done():
@@ -621,13 +814,26 @@ func (c *Container) Cleanup(ctx context.Context) error {
 		defer c.lock.Unlock()
 
 		if err := c.syncContainer(); err != nil {
+			// When the container has already been removed, the OCI runtime directory remains.
+			if errors.Is(err, define.ErrNoSuchCtr) || errors.Is(err, define.ErrCtrRemoved) {
+				if err := c.cleanupRuntime(ctx); err != nil {
+					return fmt.Errorf("cleaning up container %s from OCI runtime: %w", c.ID(), err)
+				}
+				return nil
+			}
+			logrus.Errorf("Syncing container %s status: %v", c.ID(), err)
 			return err
 		}
 	}
 
 	// Check if state is good
 	if !c.ensureState(define.ContainerStateConfigured, define.ContainerStateCreated, define.ContainerStateStopped, define.ContainerStateStopping, define.ContainerStateExited) {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "container %s is running or paused, refusing to clean up", c.ID())
+		return fmt.Errorf("container %s is running or paused, refusing to clean up: %w", c.ID(), define.ErrCtrStateInvalid)
+	}
+
+	// if the container was not created in the oci runtime or was already cleaned up, then do nothing
+	if c.ensureState(define.ContainerStateConfigured, define.ContainerStateExited) {
+		return nil
 	}
 
 	// Handle restart policy.
@@ -643,13 +849,28 @@ func (c *Container) Cleanup(ctx context.Context) error {
 
 	// If we didn't restart, we perform a normal cleanup
 
+	// make sure all the container processes are terminated if we are running without a pid namespace.
+	hasPidNs := false
+	if c.config.Spec.Linux != nil {
+		for _, i := range c.config.Spec.Linux.Namespaces {
+			if i.Type == spec.PIDNamespace {
+				hasPidNs = true
+				break
+			}
+		}
+	}
+	if !hasPidNs {
+		// do not fail on errors
+		_ = c.ociRuntime.KillContainer(c, uint(unix.SIGKILL), true)
+	}
+
 	// Check for running exec sessions
 	sessions, err := c.getActiveExecSessions()
 	if err != nil {
 		return err
 	}
 	if len(sessions) > 0 {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "container %s has active exec sessions, refusing to clean up", c.ID())
+		return fmt.Errorf("container %s has active exec sessions, refusing to clean up: %w", c.ID(), define.ErrCtrStateInvalid)
 	}
 
 	defer c.newContainerEvent(events.Cleanup)
@@ -673,10 +894,6 @@ func (c *Container) Batch(batchFunc func(*Container) error) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if err := c.syncContainer(); err != nil {
-		return err
-	}
-
 	newCtr := new(Container)
 	newCtr.config = c.config
 	newCtr.state = c.state
@@ -698,7 +915,7 @@ func (c *Container) Batch(batchFunc func(*Container) error) error {
 // Most of the time, Podman does not explicitly query the OCI runtime for
 // container status, and instead relies upon exit files created by conmon.
 // This can cause a disconnect between running state and what Podman sees in
-// cases where Conmon was killed unexpected, or runc was upgraded.
+// cases where Conmon was killed unexpectedly, or runc was upgraded.
 // Running a manual Sync() ensures that container state will be correct in
 // such situations.
 func (c *Container) Sync() error {
@@ -707,19 +924,8 @@ func (c *Container) Sync() error {
 		defer c.lock.Unlock()
 	}
 
-	// If runtime knows about the container, update its status in runtime
-	// And then save back to disk
-	if c.ensureState(define.ContainerStateCreated, define.ContainerStateRunning, define.ContainerStatePaused, define.ContainerStateStopped, define.ContainerStateStopping) {
-		oldState := c.state.State
-		if err := c.ociRuntime.UpdateContainerStatus(c); err != nil {
-			return err
-		}
-		// Only save back to DB if state changed
-		if c.state.State != oldState {
-			if err := c.save(); err != nil {
-				return err
-			}
-		}
+	if err := c.syncContainer(); err != nil {
+		return err
 	}
 
 	defer c.newContainerEvent(events.Sync)
@@ -746,7 +952,7 @@ func (c *Container) ReloadNetwork() error {
 	}
 
 	if !c.ensureState(define.ContainerStateCreated, define.ContainerStateRunning) {
-		return errors.Wrapf(define.ErrCtrStateInvalid, "cannot reload network unless container network has been configured")
+		return fmt.Errorf("cannot reload network unless container network has been configured: %w", define.ErrCtrStateInvalid)
 	}
 
 	return c.reloadNetwork()
@@ -955,4 +1161,9 @@ func (c *Container) Stat(ctx context.Context, containerPath string) (*define.Fil
 
 	info, _, _, err := c.stat(mountPoint, containerPath)
 	return info, err
+}
+
+func saveContainerError(c *Container, err error) error {
+	c.state.Error = err.Error()
+	return c.save()
 }

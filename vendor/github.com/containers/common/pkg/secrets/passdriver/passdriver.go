@@ -3,26 +3,17 @@ package passdriver
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/pkg/errors"
-)
-
-var (
-	// errNoSecretData indicates that there is not data associated with an id
-	errNoSecretData = errors.New("no secret data with ID")
-
-	// errNoSecretData indicates that there is secret data already associated with an id
-	errSecretIDExists = errors.New("secret data with ID already exists")
-
-	// errInvalidKey indicates that something about your key is wrong
-	errInvalidKey = errors.New("invalid key")
+	"github.com/containers/common/pkg/secrets/define"
+	"github.com/containers/storage/pkg/fileutils"
 )
 
 type driverConfig struct {
@@ -60,7 +51,7 @@ func defaultDriverConfig() *driverConfig {
 				continue
 			}
 			cfg.Root = path
-			bs, err := ioutil.ReadFile(filepath.Join(path, ".gpg-id"))
+			bs, err := os.ReadFile(filepath.Join(path, ".gpg-id"))
 			if err != nil {
 				continue
 			}
@@ -75,8 +66,8 @@ func defaultDriverConfig() *driverConfig {
 func (cfg *driverConfig) findGpgID() {
 	path := cfg.Root
 	for len(path) > 1 {
-		if _, err := os.Stat(filepath.Join(path, ".gpg-id")); err == nil {
-			bs, err := ioutil.ReadFile(filepath.Join(path, ".gpg-id"))
+		if err := fileutils.Exists(filepath.Join(path, ".gpg-id")); err == nil {
+			bs, err := os.ReadFile(filepath.Join(path, ".gpg-id"))
 			if err != nil {
 				continue
 			}
@@ -106,9 +97,9 @@ func NewDriver(opts map[string]string) (*Driver, error) {
 
 // List returns all secret IDs
 func (d *Driver) List() (secrets []string, err error) {
-	files, err := ioutil.ReadDir(d.Root)
+	files, err := os.ReadDir(d.Root)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to read secret directory")
+		return nil, fmt.Errorf("failed to read secret directory: %w", err)
 	}
 	for _, f := range files {
 		fileName := f.Name()
@@ -127,10 +118,10 @@ func (d *Driver) Lookup(id string) ([]byte, error) {
 		return nil, err
 	}
 	if err := d.gpg(context.TODO(), nil, out, "--decrypt", key); err != nil {
-		return nil, errors.Wrapf(errNoSecretData, id)
+		return nil, fmt.Errorf("%s: %w", id, define.ErrNoSuchSecret)
 	}
 	if out.Len() == 0 {
-		return nil, errors.Wrapf(errNoSecretData, id)
+		return nil, fmt.Errorf("%s: %w", id, define.ErrNoSuchSecret)
 	}
 	return out.Bytes(), nil
 }
@@ -138,7 +129,7 @@ func (d *Driver) Lookup(id string) ([]byte, error) {
 // Store saves the bytes associated with an ID. An error is returned if the ID already exists
 func (d *Driver) Store(id string, data []byte) error {
 	if _, err := d.Lookup(id); err == nil {
-		return errors.Wrap(errSecretIDExists, id)
+		return fmt.Errorf("%s: %w", id, define.ErrSecretIDExists)
 	}
 	in := bytes.NewReader(data)
 	key, err := d.getPath(id)
@@ -155,7 +146,10 @@ func (d *Driver) Delete(id string) error {
 		return err
 	}
 	if err := os.Remove(key); err != nil {
-		return errors.Wrap(errNoSecretData, id)
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%s: %w", id, define.ErrNoSuchSecret)
+		}
+		return fmt.Errorf("%s: %w", id, err)
 	}
 	return nil
 }
@@ -168,17 +162,17 @@ func (d *Driver) gpg(ctx context.Context, in io.Reader, out io.Writer, args ...s
 	cmd.Env = os.Environ()
 	cmd.Stdin = in
 	cmd.Stdout = out
-	cmd.Stderr = ioutil.Discard
+	cmd.Stderr = io.Discard
 	return cmd.Run()
 }
 
 func (d *Driver) getPath(id string) (string, error) {
 	path, err := filepath.Abs(filepath.Join(d.Root, id))
 	if err != nil {
-		return "", errInvalidKey
+		return "", define.ErrInvalidKey
 	}
 	if !strings.HasPrefix(path, d.Root) {
-		return "", errInvalidKey
+		return "", define.ErrInvalidKey
 	}
 	return path + ".gpg", nil
 }

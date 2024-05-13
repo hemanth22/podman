@@ -3,19 +3,21 @@ package libpod
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/containers/common/libimage"
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/auth"
-	"github.com/containers/podman/v4/pkg/channel"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/auth"
+	"github.com/containers/podman/v5/pkg/channel"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/gorilla/schema"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -27,21 +29,30 @@ func ImagesPull(w http.ResponseWriter, r *http.Request) {
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 	decoder := r.Context().Value(api.DecoderKey).(*schema.Decoder)
 	query := struct {
-		Reference  string `schema:"reference"`
-		OS         string `schema:"OS"`
-		Arch       string `schema:"Arch"`
-		Variant    string `schema:"Variant"`
-		TLSVerify  bool   `schema:"tlsVerify"`
 		AllTags    bool   `schema:"allTags"`
+		CompatMode bool   `schema:"compatMode"`
 		PullPolicy string `schema:"policy"`
 		Quiet      bool   `schema:"quiet"`
+		Reference  string `schema:"reference"`
+		Retry      uint   `schema:"retry"`
+		RetryDelay string `schema:"retrydelay"`
+		TLSVerify  bool   `schema:"tlsVerify"`
+		// Platform fields below:
+		Arch    string `schema:"Arch"`
+		OS      string `schema:"OS"`
+		Variant string `schema:"Variant"`
 	}{
 		TLSVerify:  true,
 		PullPolicy: "always",
 	}
 
 	if err := decoder.Decode(&query, r.URL.Query()); err != nil {
-		utils.Error(w, http.StatusBadRequest, errors.Wrapf(err, "failed to parse parameters for %s", r.URL.String()))
+		utils.Error(w, http.StatusBadRequest, fmt.Errorf("failed to parse parameters for %s: %w", r.URL.String(), err))
+		return
+	}
+
+	if query.Quiet && query.CompatMode {
+		utils.InternalServerError(w, errors.New("'quiet' and 'compatMode' cannot be used simultaneously"))
 		return
 	}
 
@@ -81,16 +92,49 @@ func ImagesPull(w http.ResponseWriter, r *http.Request) {
 		pullOptions.IdentityToken = authConf.IdentityToken
 	}
 
-	writer := channel.NewWriter(make(chan []byte))
-	defer writer.Close()
-
-	pullOptions.Writer = writer
-
 	pullPolicy, err := config.ParsePullPolicy(query.PullPolicy)
 	if err != nil {
 		utils.Error(w, http.StatusBadRequest, err)
 		return
 	}
+
+	if _, found := r.URL.Query()["retry"]; found {
+		pullOptions.MaxRetries = &query.Retry
+	}
+
+	if _, found := r.URL.Query()["retrydelay"]; found {
+		duration, err := time.ParseDuration(query.RetryDelay)
+		if err != nil {
+			utils.Error(w, http.StatusBadRequest, err)
+			return
+		}
+		pullOptions.RetryDelay = &duration
+	}
+
+	// Let's keep thing simple when running in quiet mode and pull directly.
+	if query.Quiet {
+		images, err := runtime.LibimageRuntime().Pull(r.Context(), query.Reference, pullPolicy, pullOptions)
+		var report entities.ImagePullReport
+		if err != nil {
+			report.Error = err.Error()
+		}
+		for _, image := range images {
+			report.Images = append(report.Images, image.ID())
+			// Pull last ID from list and publish in 'id' stanza.  This maintains previous API contract
+			report.ID = image.ID()
+		}
+		utils.WriteResponse(w, http.StatusOK, report)
+		return
+	}
+
+	if query.CompatMode {
+		utils.CompatPull(r.Context(), w, runtime, query.Reference, pullPolicy, pullOptions)
+		return
+	}
+
+	writer := channel.NewWriter(make(chan []byte))
+	defer writer.Close()
+	pullOptions.Writer = writer
 
 	var pulledImages []*libimage.Image
 	var pullError error
@@ -117,10 +161,8 @@ func ImagesPull(w http.ResponseWriter, r *http.Request) {
 		select {
 		case s := <-writer.Chan():
 			report.Stream = string(s)
-			if !query.Quiet {
-				if err := enc.Encode(report); err != nil {
-					logrus.Warnf("Failed to encode json: %v", err)
-				}
+			if err := enc.Encode(report); err != nil {
+				logrus.Warnf("Failed to encode json: %v", err)
 			}
 			flush()
 		case <-runCtx.Done():

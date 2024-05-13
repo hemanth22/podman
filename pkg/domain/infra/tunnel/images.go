@@ -2,24 +2,26 @@ package tunnel
 
 import (
 	"context"
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/containers/common/libimage"
+	bdefine "github.com/containers/buildah/define"
+	"github.com/containers/common/libimage/filter"
 	"github.com/containers/common/pkg/config"
+	"github.com/containers/common/pkg/ssh"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/bindings/images"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/entities/reports"
-	"github.com/containers/podman/v4/pkg/domain/utils"
-	"github.com/containers/podman/v4/pkg/errorhandling"
-	utils2 "github.com/containers/podman/v4/utils"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/bindings/images"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/domain/utils"
+	"github.com/containers/podman/v5/pkg/errorhandling"
+	"github.com/containers/storage/pkg/archive"
 )
 
 func (ir *ImageEngine) Exists(_ context.Context, nameOrID string) (*entities.BoolReport, error) {
@@ -28,15 +30,15 @@ func (ir *ImageEngine) Exists(_ context.Context, nameOrID string) (*entities.Boo
 }
 
 func (ir *ImageEngine) Remove(ctx context.Context, imagesArg []string, opts entities.ImageRemoveOptions) (*entities.ImageRemoveReport, []error) {
-	options := new(images.RemoveOptions).WithForce(opts.Force).WithIgnore(opts.Ignore).WithAll(opts.All)
+	options := new(images.RemoveOptions).WithForce(opts.Force).WithIgnore(opts.Ignore).WithAll(opts.All).WithLookupManifest(opts.LookupManifest).WithNoPrune(opts.NoPrune)
 	return images.Remove(ir.ClientCtx, imagesArg, options)
 }
 
 func (ir *ImageEngine) List(ctx context.Context, opts entities.ImageListOptions) ([]*entities.ImageSummary, error) {
 	filters := make(map[string][]string, len(opts.Filter))
 	for _, filter := range opts.Filter {
-		f := strings.Split(filter, "=")
-		filters[f[0]] = f[1:]
+		f := strings.SplitN(filter, "=", 2)
+		filters[f[0]] = append(filters[f[0]], f[1])
 	}
 	options := new(images.ListOptions).WithAll(opts.All).WithFilters(filters)
 	psImages, err := images.List(ir.ClientCtx, options)
@@ -105,10 +107,15 @@ func (ir *ImageEngine) Prune(ctx context.Context, opts entities.ImagePruneOption
 }
 
 func (ir *ImageEngine) Pull(ctx context.Context, rawImage string, opts entities.ImagePullOptions) (*entities.ImagePullReport, error) {
+	if opts.OciDecryptConfig != nil {
+		return nil, fmt.Errorf("decryption is not supported for remote clients")
+	}
+
 	options := new(images.PullOptions)
 	options.WithAllTags(opts.AllTags).WithAuthfile(opts.Authfile).WithArch(opts.Arch).WithOS(opts.OS)
 	options.WithVariant(opts.Variant).WithPassword(opts.Password)
 	options.WithQuiet(opts.Quiet).WithUsername(opts.Username).WithPolicy(opts.PullPolicy.String())
+	options.WithProgressWriter(opts.Writer)
 	if s := opts.SkipTLSVerify; s != types.OptionalBoolUndefined {
 		if s == types.OptionalBoolTrue {
 			options.WithSkipTLSVerify(true)
@@ -116,15 +123,17 @@ func (ir *ImageEngine) Pull(ctx context.Context, rawImage string, opts entities.
 			options.WithSkipTLSVerify(false)
 		}
 	}
+	if opts.Retry != nil {
+		options.WithRetry(*opts.Retry)
+	}
+	if opts.RetryDelay != "" {
+		options.WithRetryDelay(opts.RetryDelay)
+	}
 	pulledImages, err := images.Pull(ir.ClientCtx, rawImage, options)
 	if err != nil {
 		return nil, err
 	}
 	return &entities.ImagePullReport{Images: pulledImages}, nil
-}
-
-func (ir *ImageEngine) Transfer(ctx context.Context, source entities.ImageScpOptions, dest entities.ImageScpOptions, parentFlags []string) error {
-	return errors.Wrapf(define.ErrNotImplemented, "cannot use the remote client to transfer images between root and rootless storage")
 }
 
 func (ir *ImageEngine) Tag(ctx context.Context, nameOrID string, tags []string, opt entities.ImageTagOptions) error {
@@ -135,7 +144,7 @@ func (ir *ImageEngine) Tag(ctx context.Context, nameOrID string, tags []string, 
 		)
 		ref, err := reference.Parse(newTag)
 		if err != nil {
-			return errors.Wrapf(err, "error parsing reference %q", newTag)
+			return fmt.Errorf("parsing reference %q: %w", newTag, err)
 		}
 		if t, ok := ref.(reference.Tagged); ok {
 			tag = t.Tag()
@@ -144,7 +153,7 @@ func (ir *ImageEngine) Tag(ctx context.Context, nameOrID string, tags []string, 
 			repo = r.Name()
 		}
 		if len(repo) < 1 {
-			return errors.Errorf("invalid image name %q", nameOrID)
+			return fmt.Errorf("invalid image name %q", nameOrID)
 		}
 		if err := images.Tag(ir.ClientCtx, nameOrID, tag, repo, options); err != nil {
 			return err
@@ -165,7 +174,7 @@ func (ir *ImageEngine) Untag(ctx context.Context, nameOrID string, tags []string
 		)
 		ref, err := reference.Parse(newTag)
 		if err != nil {
-			return errors.Wrapf(err, "error parsing reference %q", newTag)
+			return fmt.Errorf("parsing reference %q: %w", newTag, err)
 		}
 		if t, ok := ref.(reference.Tagged); ok {
 			tag = t.Tag()
@@ -177,7 +186,7 @@ func (ir *ImageEngine) Untag(ctx context.Context, nameOrID string, tags []string
 			repo = r.Name()
 		}
 		if len(repo) < 1 {
-			return errors.Errorf("invalid image name %q", nameOrID)
+			return fmt.Errorf("invalid image name %q", nameOrID)
 		}
 		if err := images.Untag(ir.ClientCtx, nameOrID, tag, repo, options); err != nil {
 			return err
@@ -198,7 +207,7 @@ func (ir *ImageEngine) Inspect(ctx context.Context, namesOrIDs []string, opts en
 				return nil, nil, err
 			}
 			if errModel.ResponseCode == 404 {
-				errs = append(errs, errors.Wrapf(err, "unable to inspect %q", i))
+				errs = append(errs, fmt.Errorf("unable to inspect %q: %w", i, err))
 				continue
 			}
 			return nil, nil, err
@@ -219,7 +228,7 @@ func (ir *ImageEngine) Load(ctx context.Context, opts entities.ImageLoadOptions)
 		return nil, err
 	}
 	if fInfo.IsDir() {
-		return nil, errors.Errorf("remote client supports archives only but %q is a directory", opts.Input)
+		return nil, fmt.Errorf("remote client supports archives only but %q is a directory", opts.Input)
 	}
 	return images.Load(ir.ClientCtx, f)
 }
@@ -242,9 +251,20 @@ func (ir *ImageEngine) Import(ctx context.Context, opts entities.ImageImportOpti
 	return images.Import(ir.ClientCtx, f, options)
 }
 
-func (ir *ImageEngine) Push(ctx context.Context, source string, destination string, opts entities.ImagePushOptions) error {
+func (ir *ImageEngine) Push(ctx context.Context, source string, destination string, opts entities.ImagePushOptions) (*entities.ImagePushReport, error) {
+	if opts.Signers != nil {
+		return nil, fmt.Errorf("forwarding Signers is not supported for remote clients")
+	}
+	if opts.OciEncryptConfig != nil {
+		return nil, fmt.Errorf("encryption is not supported for remote clients")
+	}
+
 	options := new(images.PushOptions)
-	options.WithAll(opts.All).WithCompress(opts.Compress).WithUsername(opts.Username).WithPassword(opts.Password).WithAuthfile(opts.Authfile).WithFormat(opts.Format).WithRemoveSignatures(opts.RemoveSignatures)
+	options.WithAll(opts.All).WithCompress(opts.Compress).WithUsername(opts.Username).WithPassword(opts.Password).WithAuthfile(opts.Authfile).WithFormat(opts.Format).WithRemoveSignatures(opts.RemoveSignatures).WithQuiet(opts.Quiet).WithCompressionFormat(opts.CompressionFormat).WithProgressWriter(opts.Writer).WithForceCompressionFormat(opts.ForceCompressionFormat)
+
+	if opts.CompressionLevel != nil {
+		options.WithCompressionLevel(*opts.CompressionLevel)
+	}
 
 	if s := opts.SkipTLSVerify; s != types.OptionalBoolUndefined {
 		if s == types.OptionalBoolTrue {
@@ -253,7 +273,16 @@ func (ir *ImageEngine) Push(ctx context.Context, source string, destination stri
 			options.WithSkipTLSVerify(false)
 		}
 	}
-	return images.Push(ir.ClientCtx, source, destination, options)
+	if opts.Retry != nil {
+		options.WithRetry(*opts.Retry)
+	}
+	if opts.RetryDelay != "" {
+		options.WithRetryDelay(opts.RetryDelay)
+	}
+	if err := images.Push(ir.ClientCtx, source, destination, options); err != nil {
+		return nil, err
+	}
+	return &entities.ImagePushReport{ManifestDigest: options.GetManifestDigest()}, nil
 }
 
 func (ir *ImageEngine) Save(ctx context.Context, nameOrID string, tags []string, opts entities.ImageSaveOptions) error {
@@ -266,15 +295,24 @@ func (ir *ImageEngine) Save(ctx context.Context, nameOrID string, tags []string,
 
 	switch opts.Format {
 	case "oci-dir", "docker-dir":
-		f, err = ioutil.TempFile("", "podman_save")
+		f, err = os.CreateTemp("", "podman_save")
 		if err == nil {
 			defer func() { _ = os.Remove(f.Name()) }()
 		}
 	default:
-		// This code was added to allow for opening stdout replacing
-		// os.Create(opts.Output) which was attempting to open the file
-		// for read/write which fails on Darwin platforms
-		f, err = os.OpenFile(opts.Output, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		// This is ugly but I think the best we can do for now,
+		// on windows there is no /dev/stdout but the save command defaults to /dev/stdout.
+		// The proper thing to do would be to pass an io.Writer down from the cli frontend
+		// but since the local save API does not support an io.Writer this is impossible.
+		// I reported it a while ago in https://github.com/containers/common/issues/1275
+		if opts.Output == "/dev/stdout" {
+			f = os.Stdout
+		} else {
+			// This code was added to allow for opening stdout replacing
+			// os.Create(opts.Output) which was attempting to open the file
+			// for read/write which fails on Darwin platforms
+			f, err = os.OpenFile(opts.Output, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		}
 	}
 	if err != nil {
 		return err
@@ -300,7 +338,7 @@ func (ir *ImageEngine) Save(ctx context.Context, nameOrID string, tags []string,
 	switch {
 	case err == nil:
 		if info.Mode().IsRegular() {
-			return errors.Errorf("%q already exists as a regular file", opts.Output)
+			return fmt.Errorf("%q already exists as a regular file", opts.Output)
 		}
 	case os.IsNotExist(err):
 		if err := os.Mkdir(opts.Output, 0755); err != nil {
@@ -309,12 +347,13 @@ func (ir *ImageEngine) Save(ctx context.Context, nameOrID string, tags []string,
 	default:
 		return err
 	}
-	return utils2.UntarToFileSystem(opts.Output, f, nil)
+
+	return archive.Untar(f, opts.Output, &archive.TarOptions{NoLchown: true})
 }
 
 func (ir *ImageEngine) Search(ctx context.Context, term string, opts entities.ImageSearchOptions) ([]entities.ImageSearchReport, error) {
 	mappedFilters := make(map[string][]string)
-	filters, err := libimage.ParseSearchFilter(opts.Filters)
+	filters, err := filter.ParseSearchFilter(opts.Filters)
 	if err != nil {
 		return nil, err
 	}
@@ -332,7 +371,7 @@ func (ir *ImageEngine) Search(ctx context.Context, term string, opts entities.Im
 
 	options := new(images.SearchOptions)
 	options.WithAuthfile(opts.Authfile).WithFilters(mappedFilters).WithLimit(opts.Limit)
-	options.WithListTags(opts.ListTags)
+	options.WithListTags(opts.ListTags).WithPassword(opts.Password).WithUsername(opts.Username)
 	if s := opts.SkipTLSVerify; s != types.OptionalBoolUndefined {
 		if s == types.OptionalBoolTrue {
 			options.WithSkipTLSVerify(true)
@@ -352,6 +391,10 @@ func (ir *ImageEngine) Build(_ context.Context, containerFiles []string, opts en
 	if err != nil {
 		return nil, err
 	}
+	report.SaveFormat = define.OCIArchive
+	if opts.OutputFormat == bdefine.Dockerv2ImageManifest {
+		report.SaveFormat = define.V2s2Archive
+	}
 	return report, nil
 }
 
@@ -366,4 +409,24 @@ func (ir *ImageEngine) Shutdown(_ context.Context) {
 
 func (ir *ImageEngine) Sign(ctx context.Context, names []string, options entities.SignOptions) (*entities.SignReport, error) {
 	return nil, errors.New("not implemented yet")
+}
+
+func (ir *ImageEngine) Scp(ctx context.Context, src, dst string, parentFlags []string, quiet bool, sshMode ssh.EngineMode) error {
+	options := new(images.ScpOptions)
+
+	var destination *string
+	if len(dst) > 1 {
+		destination = &dst
+	}
+	options.Quiet = &quiet
+	options.Destination = destination
+
+	rep, err := images.Scp(ir.ClientCtx, &src, destination, *options)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Loaded Image(s):", rep.Id)
+
+	return nil
 }

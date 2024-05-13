@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package main
 
@@ -12,20 +11,28 @@ import (
 	"syscall"
 	"unsafe"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
 type operation int
 
 const (
-	HWND_BROADCAST             = 0xFFFF
-	WM_SETTINGCHANGE           = 0x001A
-	SMTO_ABORTIFHUNG           = 0x0002
-	ERR_BAD_ARGS               = 0x000A
-	OPERATION_FAILED           = 0x06AC
-	Environment                = "Environment"
-	Add              operation = iota
+	//nolint:stylecheck
+	HWND_BROADCAST = 0xFFFF
+	//nolint:stylecheck
+	WM_SETTINGCHANGE = 0x001A
+	//nolint:stylecheck
+	SMTO_ABORTIFHUNG = 0x0002
+	//nolint:stylecheck
+	ERR_BAD_ARGS = 0x000A
+	//nolint:stylecheck
+	OPERATION_FAILED = 0x06AC
+
+	Environment           = "Environment"
+	Add         operation = iota
 	Remove
+	Open
 	NotSpecified
 )
 
@@ -37,6 +44,8 @@ func main() {
 			op = Add
 		case "remove":
 			op = Remove
+		case "open":
+			op = Open
 		}
 	}
 
@@ -44,6 +53,14 @@ func main() {
 	if op == NotSpecified {
 		alert("Usage: " + filepath.Base(os.Args[0]) + " [add|remove]\n\nThis utility adds or removes the podman directory to the Windows Path.")
 		os.Exit(ERR_BAD_ARGS)
+	}
+
+	// Hidden operation as a workaround for the installer
+	if op == Open && len(os.Args) > 2 {
+		if err := winOpenFile(os.Args[2]); err != nil {
+			os.Exit(OPERATION_FAILED)
+		}
+		os.Exit(0)
 	}
 
 	if err := modify(op); err != nil {
@@ -119,7 +136,7 @@ func removePathFromRegistry(path string) error {
 	k, err := registry.OpenKey(registry.CURRENT_USER, Environment, registry.READ|registry.WRITE)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			// Nothing to cleanup, the Environment registry key does not exist.
+			// Nothing to clean up, the Environment registry key does not exist.
 			return nil
 		}
 		return err
@@ -132,6 +149,8 @@ func removePathFromRegistry(path string) error {
 		return err
 	}
 
+	// No point preallocating we can't know how big the array needs to be.
+	//nolint:prealloc
 	var elements []string
 	for _, element := range strings.Split(existing, ";") {
 		if strings.EqualFold(element, path) {
@@ -163,6 +182,7 @@ func broadcastEnvironmentChange() {
 	user32 := syscall.NewLazyDLL("user32")
 	proc := user32.NewProc("SendMessageTimeoutW")
 	millis := 3000
+	//nolint:dogsled
 	_, _, _ = proc.Call(HWND_BROADCAST, WM_SETTINGCHANGE, 0, uintptr(unsafe.Pointer(env)), SMTO_ABORTIFHUNG, uintptr(millis), 0)
 }
 
@@ -181,4 +201,10 @@ func alert(caption string) int {
 		uintptr(format))
 
 	return int(ret)
+}
+
+func winOpenFile(file string) error {
+	verb, _ := syscall.UTF16PtrFromString("open")
+	fileW, _ := syscall.UTF16PtrFromString(file)
+	return windows.ShellExecute(0, verb, fileW, nil, nil, windows.SW_NORMAL)
 }

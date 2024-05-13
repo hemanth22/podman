@@ -19,30 +19,18 @@ set -eo pipefail
 # shellcheck source=contrib/cirrus/lib.sh
 source $(dirname $0)/lib.sh
 
-function _run_ext_svc() {
-    $SCRIPT_BASE/ext_svc_check.sh
-}
-
-function _run_automation() {
-    $SCRIPT_BASE/cirrus_yaml_test.py
-
-    req_env_vars CI DEST_BRANCH IMAGE_SUFFIX TEST_FLAVOR TEST_ENVIRON \
-                 PODBIN_NAME PRIV_NAME DISTRO_NV CONTAINER USER HOME \
-                 UID AUTOMATION_LIB_PATH SCRIPT_BASE OS_RELEASE_ID \
-                 CG_FS_TYPE
-    bigto ooe.sh dnf install -y ShellCheck  # small/quick addition
-    $SCRIPT_BASE/shellcheck.sh
-}
+showrun echo "starting"
 
 function _run_validate() {
     # git-validation tool fails if $EPOCH_TEST_COMMIT is empty
     # shellcheck disable=SC2154
     if [[ -n "$EPOCH_TEST_COMMIT" ]]; then
-        make validate
+        showrun make validate
     else
         warn "Skipping git-validation since \$EPOCH_TEST_COMMIT is empty"
     fi
-
+    # make sure PRs have tests
+    showrun make tests-included
 }
 
 function _run_unit() {
@@ -53,29 +41,23 @@ function _run_unit() {
         # shellcheck disable=SC2154
         die "$TEST_FLAVOR: Unsupported PODBIN_NAME='$PODBIN_NAME'"
     fi
-    make localunit
+    showrun make localunit
 }
 
 function _run_apiv2() {
     _bail_if_test_can_be_skipped test/apiv2
 
     (
-        make localapiv2-bash
+        showrun make localapiv2-bash
         source .venv/requests/bin/activate
-        make localapiv2-python
+        showrun make localapiv2-python
     ) |& logformatter
-}
-
-function _run_compose() {
-    _bail_if_test_can_be_skipped test/compose
-
-    ./test/compose/test-compose |& logformatter
 }
 
 function _run_compose_v2() {
     _bail_if_test_can_be_skipped test/compose
 
-    ./test/compose/test-compose |& logformatter
+    showrun ./test/compose/test-compose |& logformatter
 }
 
 function _run_int() {
@@ -91,20 +73,20 @@ function _run_sys() {
 }
 
 function _run_upgrade_test() {
-    _bail_if_test_can_be_skipped test/upgrade
+    _bail_if_test_can_be_skipped test/system test/upgrade
 
-    bats test/upgrade |& logformatter
+    showrun bats test/upgrade |& logformatter
 }
 
 function _run_bud() {
     _bail_if_test_can_be_skipped test/buildah-bud
 
-    ./test/buildah-bud/run-buildah-bud-tests |& logformatter
+    showrun ./test/buildah-bud/run-buildah-bud-tests |& logformatter
 }
 
 function _run_bindings() {
-    # shellcheck disable=SC2155
-    export PATH=$PATH:$GOSRC/hack
+    # install ginkgo
+    showrun make .install.ginkgo
 
     # if logformatter sees this, it can link directly to failing source lines
     local gitcommit_magic=
@@ -112,21 +94,30 @@ function _run_bindings() {
         gitcommit_magic="/define.gitCommit=${GIT_COMMIT}"
     fi
 
-    # Subshell needed so logformatter will write output in cwd; if it runs in
-    # the subdir, .cirrus.yml will not find the html'ized log
-    (cd pkg/bindings/test && \
-         echo "$gitcommit_magic" && \
-         ginkgo -progress -trace -noColor -debug -timeout 30m -r -v) |& logformatter
+    (echo "$gitcommit_magic" && \
+        showrun make testbindings) |& logformatter
 }
 
 function _run_docker-py() {
     source .venv/docker-py/bin/activate
-    make run-docker-py-tests
+    showrun make run-docker-py-tests
 }
 
 function _run_endpoint() {
-    make test-binaries
-    make endpoint
+    showrun make test-binaries
+    showrun make endpoint
+}
+
+function _run_minikube() {
+    _bail_if_test_can_be_skipped test/minikube
+    msg "Testing  minikube."
+    showrun bats test/minikube |& logformatter
+}
+
+function _run_farm() {
+    _bail_if_test_can_be_skipped test/farm test/system
+    msg "Testing podman farm."
+    showrun bats test/farm |& logformatter
 }
 
 exec_container() {
@@ -141,15 +132,18 @@ exec_container() {
 
     # Line-separated arguments which include shell-escaped special characters
     declare -a envargs
-    while read -r var_val; do
-        envargs+=("-e $var_val")
+    while read -r var; do
+        # Pass "-e VAR" on the command line, not "-e VAR=value". Podman can
+        # do a much better job of transmitting the value than we can,
+        # especially when value includes spaces.
+        envargs+=("-e" "$var")
     done <<<"$(passthrough_envars)"
 
     # VM Images and Container images are built using (nearly) identical operations.
     set -x
     # shellcheck disable=SC2154
-    exec podman run --rm --privileged --net=host --cgroupns=host \
-        -v `mktemp -d -p /var/tmp`:/tmp:Z \
+    exec bin/podman run --rm --privileged --net=host --cgroupns=host \
+        -v `mktemp -d -p /var/tmp`:/var/tmp:Z \
         -v /dev/fuse:/dev/fuse \
         -v "$GOPATH:$GOPATH:Z" \
         --workdir "$GOSRC" \
@@ -164,9 +158,6 @@ function _run_swagger() {
     local download_url
     local envvarsfile
     req_env_vars GCPJSON GCPNAME GCPPROJECT CTR_FQIN
-
-    [[ -x /usr/local/bin/swagger ]] || \
-        die "Expecting swagger binary to be present and executable."
 
     # The filename and bucket depend on the automation context
     #shellcheck disable=SC2154,SC2153
@@ -189,10 +180,10 @@ function _run_swagger() {
 
     # Swagger validation takes a significant amount of time
     msg "Pulling \$CTR_FQIN '$CTR_FQIN' (background process)"
-    podman pull --quiet $CTR_FQIN &
+    showrun bin/podman pull --quiet $CTR_FQIN &
 
     cd $GOSRC
-    make swagger
+    showrun make swagger
 
     # Cirrus-CI Artifact instruction expects file here
     cp -v $GOSRC/pkg/api/swagger.yaml ./
@@ -211,7 +202,7 @@ eof
 
     msg "Waiting for backgrounded podman pull to complete..."
     wait %%
-    podman run -it --rm --security-opt label=disable \
+    showrun bin/podman run -it --rm --security-opt label=disable \
         --env-file=$envvarsfile \
         -v $GOSRC:$GOSRC:ro \
         --workdir $GOSRC \
@@ -219,38 +210,42 @@ eof
     rm -f $envvarsfile
 }
 
-function _run_consistency() {
-    make vendor
-    SUGGESTION="run 'make vendor' and commit all changes" ./hack/tree_status.sh
-    make generate-bindings
-    SUGGESTION="run 'make generate-bindings' and commit all changes" ./hack/tree_status.sh
-    make completions
-    SUGGESTION="run 'make completions' and commit all changes" ./hack/tree_status.sh
-}
-
 function _run_build() {
     # Ensure always start from clean-slate with all vendor modules downloaded
-    make clean
-    make vendor
-    make podman-release  # includes podman, podman-remote, and docs
+    showrun make clean
+    showrun make vendor
+    showrun make podman-release  # includes podman, podman-remote, and docs
+
+    # Last-minute confirmation that we're testing the desired runtime.
+    # This Can't Possibly Fail™ in regular CI; only when updating VMs.
+    # $CI_DESIRED_RUNTIME must be defined in .cirrus.yml.
+    req_env_vars CI_DESIRED_RUNTIME
+    runtime=$(bin/podman info --format '{{.Host.OCIRuntime.Name}}')
+    # shellcheck disable=SC2154
+    if [[ "$runtime" != "$CI_DESIRED_RUNTIME" ]]; then
+        die "Built podman is using '$runtime'; this CI environment requires $CI_DESIRED_RUNTIME"
+    fi
+    msg "Built podman is using expected runtime='$runtime'"
 }
 
 function _run_altbuild() {
-    # We can skip all these steps for test-only PRs, but not doc-only ones
-    _bail_if_test_can_be_skipped docs
+    # Subsequent windows-based tasks require a build.  Var. defined in .cirrus.yml
+    # shellcheck disable=SC2154
+    if [[ ! "$ALT_NAME" =~ Windows ]]; then
+        # We can skip all these steps for test-only PRs, but not doc-only ones
+        _bail_if_test_can_be_skipped docs
+    fi
 
     local -a arches
     local arch
     req_env_vars ALT_NAME
-    # Defined in .cirrus.yml
-    # shellcheck disable=SC2154
     msg "Performing alternate build: $ALT_NAME"
     msg "************************************************************"
     set -x
     cd $GOSRC
     case "$ALT_NAME" in
         *Each*)
-            git fetch origin
+            showrun git fetch origin
             # The make-and-check-size script, introduced 2022-03-22 in #13518,
             # runs 'make' (the original purpose of this check) against
             # each commit, then checks image sizes to make sure that
@@ -262,44 +257,62 @@ function _run_altbuild() {
             savedhead=$(git rev-parse HEAD)
             # Push to PR base. First run of the script will write size files
             pr_base=$(git merge-base origin/$DEST_BRANCH HEAD)
-            git checkout $pr_base
-            hack/make-and-check-size $context_dir
+            showrun git checkout $pr_base
+            showrun hack/make-and-check-size $context_dir
             # pop back to PR, and run incremental makes. Subsequent script
             # invocations will compare against original size.
-            git checkout $savedhead
-            git rebase $pr_base -x "hack/make-and-check-size $context_dir"
+            showrun git checkout $savedhead
+            showrun git rebase $pr_base -x "hack/make-and-check-size $context_dir"
             rm -rf $context_dir
             ;;
         *Windows*)
-            make podman-remote-release-windows_amd64.zip
-            make podman.msi
-            ;;
-        *Without*)
-            make build-no-cgo
+	    showrun make .install.pre-commit
+            showrun make lint GOOS=windows CGO_ENABLED=0
+            showrun make podman-remote-release-windows_amd64.zip
             ;;
         *RPM*)
-            make package
+            showrun make package
             ;;
-        Alt*Cross)
+        Alt*x86*Cross)
             arches=(\
                 amd64
-                ppc64le
+                386)
+            _build_altbuild_archs "${arches[@]}"
+            ;;
+        Alt*ARM*Cross)
+            arches=(\
                 arm
-                arm64
-                386
-                s390x
+                arm64)
+            _build_altbuild_archs "${arches[@]}"
+            ;;
+        Alt*Other*Cross)
+            arches=(\
+                ppc64le
+                s390x)
+            _build_altbuild_archs "${arches[@]}"
+            ;;
+        Alt*MIPS*Cross)
+            arches=(\
                 mips
-                mipsle
+                mipsle)
+            _build_altbuild_archs "${arches[@]}"
+            ;;
+        Alt*MIPS64*Cross*)
+            arches=(\
                 mips64
                 mips64le)
-            for arch in "${arches[@]}"; do
-                msg "Building release archive for $arch"
-                make podman-release-${arch}.tar.gz GOARCH=$arch
-            done
+            _build_altbuild_archs "${arches[@]}"
             ;;
         *)
             die "Unknown/Unsupported \$$ALT_NAME '$ALT_NAME'"
     esac
+}
+
+function _build_altbuild_archs() {
+    for arch in "$@"; do
+        msg "Building release archive for $arch"
+        showrun make podman-release-${arch}.tar.gz GOARCH=$arch
+    done
 }
 
 function _run_release() {
@@ -321,6 +334,9 @@ function _run_release() {
 }
 
 
+# ***WARNING*** ***WARNING*** ***WARNING*** ***WARNING***
+#    Please see gitlab comment in setup_environment.sh
+# ***WARNING*** ***WARNING*** ***WARNING*** ***WARNING***
 function _run_gitlab() {
     rootless_uid=$(id -u)
     systemctl enable --now --user podman.socket
@@ -337,15 +353,26 @@ function _run_gitlab() {
     return $ret
 }
 
-logformatter() {
+
+# Name pattern for logformatter output file, derived from environment
+function output_name() {
+    # .cirrus.yml defines this as a short readable string for web UI
+    std_name_fmt=$(sed -ne 's/^.*std_name_fmt \"\(.*\)\"/\1/p' <.cirrus.yml)
+    test -n "$std_name_fmt" || die "Could not grep 'std_name_fmt' from .cirrus.yml"
+
+    # Interpolate envariables. 'set -u' throws fatal if any are undefined
+    (
+        set -u
+        eval echo "$std_name_fmt" | tr ' ' '-'
+    )
+}
+
+function logformatter() {
     if [[ "$CI" == "true" ]]; then
-        # Use similar format as human-friendly task name from .cirrus.yml
-        # shellcheck disable=SC2154
-        output_name="$TEST_FLAVOR-$PODBIN_NAME-$DISTRO_NV-$PRIV_NAME-$TEST_ENVIRON"
         # Requires stdin and stderr combined!
         cat - \
             |& awk --file "${CIRRUS_WORKING_DIR}/${SCRIPT_BASE}/timestamp.awk" \
-            |& "${CIRRUS_WORKING_DIR}/${SCRIPT_BASE}/logformatter" "$output_name"
+            |& "${CIRRUS_WORKING_DIR}/${SCRIPT_BASE}/logformatter" "$(output_name)"
     else
         # Assume script is run by a human, they want output immediately
         cat -
@@ -372,12 +399,26 @@ dotest() {
         podman)  localremote="local" ;;
     esac
 
-    make ${localremote}${testsuite} PODMAN_SERVER_LOG=$PODMAN_SERVER_LOG \
+    # We've had some oopsies where tests invoke 'podman' instead of
+    # /path/to/built/podman. Let's catch those.
+    sudo rm -f /usr/bin/podman /usr/bin/podman-remote
+    fallback_podman=$(type -p podman || true)
+    if [[ -n "$fallback_podman" ]]; then
+        die "Found fallback podman '$fallback_podman' in \$PATH; tests require none, as a guarantee that we're testing the right binary."
+    fi
+
+    showrun make ${localremote}${testsuite} PODMAN_SERVER_LOG=$PODMAN_SERVER_LOG \
         |& logformatter
 }
 
+_run_machine-linux() {
+    _bail_if_test_can_be_skipped pkg/machine/e2e
+
+    showrun make localmachine |& logformatter
+}
+
 # Optimization: will exit if the only PR diffs are under docs/ or tests/
-# with the exception of any given arguments. E.g., don't run e2e or upgrade
+# with the exception of any given arguments. E.g., don't run e2e or unit
 # or bud tests if the only PR changes are in test/system.
 function _bail_if_test_can_be_skipped() {
     local head base diffs
@@ -396,13 +437,15 @@ function _bail_if_test_can_be_skipped() {
         return 0
     fi
 
+    # Defined by Cirrus-CI for all tasks
+    # shellcheck disable=SC2154
     head=$CIRRUS_CHANGE_IN_REPO
     base=$(git merge-base $DEST_BRANCH $head)
     diffs=$(git diff --name-only $base $head)
 
     # If PR touches any files in an argument directory, we cannot skip
     for subdir in "$@"; do
-        if egrep -q "^$subdir/" <<<"$diffs"; then
+        if grep -E -q "^$subdir/" <<<"$diffs"; then
             return 0
         fi
     done
@@ -412,7 +455,7 @@ function _bail_if_test_can_be_skipped() {
     # filtering these out from the diff results.
     for subdir in docs test; do
         # || true needed because we're running with set -e
-        diffs=$(egrep -v "^$subdir/" <<<"$diffs" || true)
+        diffs=$(grep -E -v "^$subdir/" <<<"$diffs" || true)
     done
 
     # If we still have diffs, they indicate files outside of docs & test.
@@ -476,6 +519,12 @@ if [[ "$PRIV_NAME" == "rootless" ]] && [[ "$UID" -eq 0 ]]; then
 fi
 # else: not running rootless, do nothing special
 
+# Dump important package versions. Before 2022-11-16 this took place as
+# a separate .cirrus.yml step, but it really belongs here.
+$(dirname $0)/logcollector.sh packages
+msg "************************************************************"
+
+
 cd "${GOSRC}/"
 
 handler="_run_${TEST_FLAVOR}"
@@ -484,4 +533,6 @@ if [ "$(type -t $handler)" != "function" ]; then
     die "Unknown/Unsupported \$TEST_FLAVOR=$TEST_FLAVOR"
 fi
 
-$handler
+showrun $handler
+
+showrun echo "finished"

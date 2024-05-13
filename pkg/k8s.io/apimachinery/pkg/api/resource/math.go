@@ -19,7 +19,7 @@ package resource
 import (
 	"math/big"
 
-	inf "gopkg.in/inf.v0"
+	"gopkg.in/inf.v0"
 )
 
 const (
@@ -29,13 +29,13 @@ const (
 )
 
 var (
-	// Commonly needed big.Int values-- treat as read only!
+	// Commonly needed big.Int values-- treat as read-only!
 	bigTen  = big.NewInt(10)
 	bigZero = big.NewInt(0)
 	bigOne  = big.NewInt(1)
 	big1024 = big.NewInt(1024)
 
-	// Commonly needed inf.Dec values-- treat as read only!
+	// Commonly needed inf.Dec values-- treat as read-only!
 	decZero = inf.NewDec(0, 0)
 	decOne  = inf.NewDec(1, 0)
 

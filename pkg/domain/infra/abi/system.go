@@ -2,26 +2,21 @@ package abi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 
-	"github.com/containers/common/pkg/cgroups"
-	"github.com/containers/common/pkg/config"
-	cutil "github.com/containers/common/pkg/util"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/entities/reports"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/util"
-	"github.com/containers/podman/v4/utils"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/containers/storage"
-	"github.com/containers/storage/pkg/unshare"
-	"github.com/pkg/errors"
+	"github.com/containers/storage/pkg/directory"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/sirupsen/logrus"
-	"github.com/spf13/pflag"
 )
 
 func (ic *ContainerEngine) Info(ctx context.Context) (*define.Info, error) {
@@ -35,8 +30,8 @@ func (ic *ContainerEngine) Info(ctx context.Context) (*define.Info, error) {
 	// we are reporting the default systemd activation socket path as we cannot know if a future
 	// service may be run with another URI.
 	if ic.Libpod.RemoteURI() == "" {
-		xdg := "/run"
-		if path, err := util.GetRuntimeDir(); err != nil {
+		xdg := defaultRunPath
+		if path, err := util.GetRootlessRuntimeDir(); err != nil {
 			// Info is as good as we can guess...
 			return info, err
 		} else if path != "" {
@@ -57,7 +52,7 @@ func (ic *ContainerEngine) Info(ctx context.Context) (*define.Info, error) {
 	}
 
 	if uri.Scheme == "unix" {
-		_, err := os.Stat(uri.Path)
+		err := fileutils.Exists(uri.Path)
 		info.Host.RemoteSocket.Exists = err == nil
 	} else {
 		info.Host.RemoteSocket.Exists = true
@@ -66,80 +61,21 @@ func (ic *ContainerEngine) Info(ctx context.Context) (*define.Info, error) {
 	return info, err
 }
 
-func (ic *ContainerEngine) SetupRootless(_ context.Context, noMoveProcess bool) error {
-	// do it only after podman has already re-execed and running with uid==0.
-	hasCapSysAdmin, err := unshare.HasCapSysAdmin()
-	if err != nil {
-		return err
-	}
-	if hasCapSysAdmin {
-		ownsCgroup, err := cgroups.UserOwnsCurrentSystemdCgroup()
-		if err != nil {
-			logrus.Infof("Failed to detect the owner for the current cgroup: %v", err)
-		}
-		if !ownsCgroup {
-			conf, err := ic.Config(context.Background())
-			if err != nil {
-				return err
-			}
-			runsUnderSystemd := utils.RunsOnSystemd()
-			unitName := fmt.Sprintf("podman-%d.scope", os.Getpid())
-			if runsUnderSystemd || conf.Engine.CgroupManager == config.SystemdCgroupsManager {
-				if err := utils.RunUnderSystemdScope(os.Getpid(), "user.slice", unitName); err != nil {
-					logrus.Debugf("Failed to add podman to systemd sandbox cgroup: %v", err)
-				}
-			}
-		}
-		return nil
-	}
-
-	tmpDir, err := ic.Libpod.TmpDir()
-	if err != nil {
-		return err
-	}
-	pausePidPath, err := util.GetRootlessPauseProcessPidPathGivenDir(tmpDir)
-	if err != nil {
-		return errors.Wrapf(err, "could not get pause process pid file path")
-	}
-
-	became, ret, err := rootless.TryJoinPauseProcess(pausePidPath)
-	if err != nil {
-		return err
-	}
-	if became {
-		os.Exit(ret)
-	}
-	if noMoveProcess {
-		return nil
-	}
-
-	// if there is no pid file, try to join existing containers, and create a pause process.
-	ctrs, err := ic.Libpod.GetRunningContainers()
-	if err != nil {
-		logrus.Error(err.Error())
-		os.Exit(1)
-	}
-
-	paths := []string{}
-	for _, ctr := range ctrs {
-		paths = append(paths, ctr.Config().ConmonPidFile)
-	}
-
-	became, ret, err = rootless.TryJoinFromFilePaths(pausePidPath, true, paths)
-	utils.MovePauseProcessToScope(pausePidPath)
-	if err != nil {
-		logrus.Error(errors.Wrapf(err, "invalid internal status, try resetting the pause process with %q", os.Args[0]+" system migrate"))
-		os.Exit(1)
-	}
-	if became {
-		os.Exit(ret)
-	}
-	return nil
-}
-
-// SystemPrune removes unused data from the system. Pruning pods, containers, volumes and images.
+// SystemPrune removes unused data from the system. Pruning pods, containers, networks, volumes and images.
 func (ic *ContainerEngine) SystemPrune(ctx context.Context, options entities.SystemPruneOptions) (*entities.SystemPruneReport, error) {
 	var systemPruneReport = new(entities.SystemPruneReport)
+
+	if options.External {
+		if options.All || options.Volume || len(options.Filters) > 0 {
+			return nil, fmt.Errorf("system prune --external cannot be combined with other options")
+		}
+		err := ic.Libpod.GarbageCollect()
+		if err != nil {
+			return nil, err
+		}
+		return systemPruneReport, nil
+	}
+
 	filters := []string{}
 	for k, v := range options.Filters {
 		filters = append(filters, fmt.Sprintf("%s=%s", k, v[0]))
@@ -148,16 +84,20 @@ func (ic *ContainerEngine) SystemPrune(ctx context.Context, options entities.Sys
 	found := true
 	for found {
 		found = false
-		podPruneReport, err := ic.prunePodHelper(ctx)
+
+		// TODO: Figure out cleaner way to handle all of the different PruneOptions
+		// Remove all unused pods.
+		podPruneReports, err := ic.prunePodHelper(ctx)
 		if err != nil {
 			return nil, err
 		}
-		if len(podPruneReport) > 0 {
+		if len(podPruneReports) > 0 {
 			found = true
 		}
-		systemPruneReport.PodPruneReport = append(systemPruneReport.PodPruneReport, podPruneReport...)
 
-		// TODO: Figure out cleaner way to handle all of the different PruneOptions
+		systemPruneReport.PodPruneReport = append(systemPruneReport.PodPruneReport, podPruneReports...)
+
+		// Remove all unused containers.
 		containerPruneOptions := entities.ContainerPruneOptions{}
 		containerPruneOptions.Filters = (url.Values)(options.Filters)
 
@@ -165,16 +105,18 @@ func (ic *ContainerEngine) SystemPrune(ctx context.Context, options entities.Sys
 		if err != nil {
 			return nil, err
 		}
+
 		reclaimedSpace += reports.PruneReportsSize(containerPruneReports)
 		systemPruneReport.ContainerPruneReports = append(systemPruneReport.ContainerPruneReports, containerPruneReports...)
+
+		// Remove all unused images.
 		imagePruneOptions := entities.ImagePruneOptions{
 			All:    options.All,
 			Filter: filters,
 		}
+
 		imageEngine := ImageEngine{Libpod: ic.Libpod}
 		imagePruneReports, err := imageEngine.Prune(ctx, imagePruneOptions)
-		reclaimedSpace += reports.PruneReportsSize(imagePruneReports)
-
 		if err != nil {
 			return nil, err
 		}
@@ -182,21 +124,42 @@ func (ic *ContainerEngine) SystemPrune(ctx context.Context, options entities.Sys
 			found = true
 		}
 
+		reclaimedSpace += reports.PruneReportsSize(imagePruneReports)
 		systemPruneReport.ImagePruneReports = append(systemPruneReport.ImagePruneReports, imagePruneReports...)
+
+		// Remove all unused networks.
+		networkPruneOptions := entities.NetworkPruneOptions{}
+		networkPruneOptions.Filters = options.Filters
+
+		networkPruneReports, err := ic.NetworkPrune(ctx, networkPruneOptions)
+		if err != nil {
+			return nil, err
+		}
+		if len(networkPruneReports) > 0 {
+			found = true
+		}
+
+		// Networks reclaimedSpace are always '0'.
+		systemPruneReport.NetworkPruneReports = append(systemPruneReport.NetworkPruneReports, networkPruneReports...)
+
+		// Remove unused volume data.
 		if options.Volume {
 			volumePruneOptions := entities.VolumePruneOptions{}
 			volumePruneOptions.Filters = (url.Values)(options.Filters)
-			volumePruneReport, err := ic.VolumePrune(ctx, volumePruneOptions)
+
+			volumePruneReports, err := ic.VolumePrune(ctx, volumePruneOptions)
 			if err != nil {
 				return nil, err
 			}
-			if len(volumePruneReport) > 0 {
+			if len(volumePruneReports) > 0 {
 				found = true
 			}
-			reclaimedSpace += reports.PruneReportsSize(volumePruneReport)
-			systemPruneReport.VolumePruneReports = append(systemPruneReport.VolumePruneReports, volumePruneReport...)
+
+			reclaimedSpace += reports.PruneReportsSize(volumePruneReports)
+			systemPruneReport.VolumePruneReports = append(systemPruneReport.VolumePruneReports, volumePruneReports...)
 		}
 	}
+
 	systemPruneReport.ReclaimedSpace = reclaimedSpace
 	return systemPruneReport, nil
 }
@@ -206,7 +169,7 @@ func (ic *ContainerEngine) SystemDf(ctx context.Context, options entities.System
 		dfImages = []*entities.SystemDfImageReport{}
 	)
 
-	imageStats, err := ic.Libpod.LibimageRuntime().DiskUsage(ctx)
+	imageStats, totalImageSize, err := ic.Libpod.LibimageRuntime().DiskUsage(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +188,7 @@ func (ic *ContainerEngine) SystemDf(ctx context.Context, options entities.System
 		dfImages = append(dfImages, &report)
 	}
 
-	// Get Containers and iterate them
+	// Get containers and iterate over them
 	cons, err := ic.Libpod.GetAllContainers()
 	if err != nil {
 		return nil, err
@@ -235,22 +198,22 @@ func (ic *ContainerEngine) SystemDf(ctx context.Context, options entities.System
 		iid, _ := c.Image()
 		state, err := c.State()
 		if err != nil {
-			return nil, errors.Wrapf(err, "Failed to get state of container %s", c.ID())
+			return nil, fmt.Errorf("failed to get state of container %s: %w", c.ID(), err)
 		}
 		conSize, err := c.RootFsSize()
 		if err != nil {
-			if errors.Cause(err) == storage.ErrContainerUnknown {
-				logrus.Error(errors.Wrapf(err, "Failed to get root file system size of container %s", c.ID()))
+			if errors.Is(err, storage.ErrContainerUnknown) {
+				logrus.Error(fmt.Errorf("failed to get root file system size of container %s: %w", c.ID(), err))
 			} else {
-				return nil, errors.Wrapf(err, "Failed to get root file system size of container %s", c.ID())
+				return nil, fmt.Errorf("failed to get root file system size of container %s: %w", c.ID(), err)
 			}
 		}
 		rwsize, err := c.RWSize()
 		if err != nil {
-			if errors.Cause(err) == storage.ErrContainerUnknown {
-				logrus.Error(errors.Wrapf(err, "Failed to get read/write size of container %s", c.ID()))
+			if errors.Is(err, storage.ErrContainerUnknown) {
+				logrus.Error(fmt.Errorf("failed to get read/write size of container %s: %w", c.ID(), err))
 			} else {
-				return nil, errors.Wrapf(err, "Failed to get read/write size of container %s", c.ID())
+				return nil, fmt.Errorf("failed to get read/write size of container %s: %w", c.ID(), err)
 			}
 		}
 		report := entities.SystemDfContainerReport{
@@ -267,25 +230,15 @@ func (ic *ContainerEngine) SystemDf(ctx context.Context, options entities.System
 		dfContainers = append(dfContainers, &report)
 	}
 
-	//	Get volumes and iterate them
+	// Get volumes and iterate over them
 	vols, err := ic.Libpod.GetAllVolumes()
 	if err != nil {
 		return nil, err
 	}
 
-	running, err := ic.Libpod.GetRunningContainers()
-	if err != nil {
-		return nil, err
-	}
-	runningContainers := make([]string, 0, len(running))
-	for _, c := range running {
-		runningContainers = append(runningContainers, c.ID())
-	}
-
 	dfVolumes := make([]*entities.SystemDfVolumeReport, 0, len(vols))
-	var reclaimableSize uint64
 	for _, v := range vols {
-		var consInUse int
+		var reclaimableSize int64
 		mountPoint, err := v.MountPoint()
 		if err != nil {
 			return nil, err
@@ -296,7 +249,7 @@ func (ic *ContainerEngine) SystemDf(ctx context.Context, options entities.System
 			// TODO: fix this.
 			continue
 		}
-		volSize, err := util.SizeOfPath(mountPoint)
+		volSize, err := directory.Size(mountPoint)
 		if err != nil {
 			return nil, err
 		}
@@ -305,38 +258,35 @@ func (ic *ContainerEngine) SystemDf(ctx context.Context, options entities.System
 			return nil, err
 		}
 		if len(inUse) == 0 {
-			reclaimableSize += volSize
-		}
-		for _, viu := range inUse {
-			if cutil.StringInSlice(viu, runningContainers) {
-				consInUse++
-			}
+			reclaimableSize = volSize
 		}
 		report := entities.SystemDfVolumeReport{
 			VolumeName:      v.Name(),
-			Links:           consInUse,
-			Size:            int64(volSize),
-			ReclaimableSize: int64(reclaimableSize),
+			Links:           len(inUse),
+			Size:            volSize,
+			ReclaimableSize: reclaimableSize,
 		}
 		dfVolumes = append(dfVolumes, &report)
 	}
+
 	return &entities.SystemDfReport{
+		ImagesSize: totalImageSize,
 		Images:     dfImages,
 		Containers: dfContainers,
 		Volumes:    dfVolumes,
 	}, nil
 }
 
-func (se *SystemEngine) Reset(ctx context.Context) error {
-	return nil
+func (ic *ContainerEngine) Reset(ctx context.Context) error {
+	return ic.Libpod.Reset(ctx)
 }
 
-func (se *SystemEngine) Renumber(ctx context.Context, flags *pflag.FlagSet, config *entities.PodmanConfig) error {
-	return nil
+func (ic *ContainerEngine) Renumber(ctx context.Context) error {
+	return ic.Libpod.RenumberLocks()
 }
 
-func (se SystemEngine) Migrate(ctx context.Context, flags *pflag.FlagSet, config *entities.PodmanConfig, options entities.SystemMigrateOptions) error {
-	return nil
+func (ic *ContainerEngine) Migrate(ctx context.Context, options entities.SystemMigrateOptions) error {
+	return ic.Libpod.Migrate(options.NewRuntime)
 }
 
 func (se SystemEngine) Shutdown(ctx context.Context) {
@@ -362,17 +312,7 @@ func (ic *ContainerEngine) Unshare(ctx context.Context, args []string, options e
 	}
 
 	if options.RootlessNetNS {
-		rootlessNetNS, err := ic.Libpod.GetRootlessNetNs(true)
-		if err != nil {
-			return err
-		}
-		// Make sure to unlock, unshare can run for a long time.
-		rootlessNetNS.Lock.Unlock()
-		// We do not want to cleanup the netns after unshare.
-		// The problem is that we cannot know if we need to cleanup and
-		// secondly unshare should allow user to setup the namespace with
-		// special things, e.g. potentially macvlan or something like that.
-		return rootlessNetNS.Do(unshare)
+		return ic.Libpod.Network().RunInRootlessNetns(unshare)
 	}
 	return unshare()
 }
@@ -385,4 +325,15 @@ func (ic ContainerEngine) Version(ctx context.Context) (*entities.SystemVersionR
 	}
 	report.Client = &v
 	return &report, err
+}
+
+func (ic ContainerEngine) Locks(ctx context.Context) (*entities.LocksReport, error) {
+	var report entities.LocksReport
+	conflicts, held, err := ic.Libpod.LockConflicts()
+	if err != nil {
+		return nil, err
+	}
+	report.LockConflicts = conflicts
+	report.LocksHeld = held
+	return &report, nil
 }

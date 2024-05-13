@@ -2,17 +2,19 @@ package abi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"path/filepath"
+	"strings"
 
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/utils"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/secrets"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/utils"
 )
 
 func (ic *ContainerEngine) SecretCreate(ctx context.Context, name string, reader io.Reader, options entities.SecretCreateOptions) (*entities.SecretCreateReport, error) {
-	data, _ := ioutil.ReadAll(reader)
+	data, _ := io.ReadAll(reader)
 	secretsPath := ic.Libpod.GetSecretsStorageDir()
 	manager, err := ic.Libpod.SecretsManager()
 	if err != nil {
@@ -41,16 +43,27 @@ func (ic *ContainerEngine) SecretCreate(ctx context.Context, name string, reader
 		}
 	}
 
-	secretID, err := manager.Store(name, data, options.Driver, options.DriverOpts)
+	storeOpts := secrets.StoreOptions{
+		DriverOpts: options.DriverOpts,
+		Labels:     options.Labels,
+		Replace:    options.Replace,
+	}
+
+	secretID, err := manager.Store(name, data, options.Driver, storeOpts)
 	if err != nil {
 		return nil, err
 	}
+
 	return &entities.SecretCreateReport{
 		ID: secretID,
 	}, nil
 }
 
-func (ic *ContainerEngine) SecretInspect(ctx context.Context, nameOrIDs []string) ([]*entities.SecretInfoReport, []error, error) {
+func (ic *ContainerEngine) SecretInspect(ctx context.Context, nameOrIDs []string, options entities.SecretInspectOptions) ([]*entities.SecretInfoReport, []error, error) {
+	var (
+		secret *secrets.Secret
+		data   []byte
+	)
 	manager, err := ic.Libpod.SecretsManager()
 	if err != nil {
 		return nil, nil, err
@@ -58,28 +71,26 @@ func (ic *ContainerEngine) SecretInspect(ctx context.Context, nameOrIDs []string
 	errs := make([]error, 0, len(nameOrIDs))
 	reports := make([]*entities.SecretInfoReport, 0, len(nameOrIDs))
 	for _, nameOrID := range nameOrIDs {
-		secret, err := manager.Lookup(nameOrID)
+		if options.ShowSecret {
+			secret, data, err = manager.LookupSecretData(nameOrID)
+		} else {
+			secret, err = manager.Lookup(nameOrID)
+		}
 		if err != nil {
-			if errors.Cause(err).Error() == "no such secret" {
+			if strings.Contains(err.Error(), "no such secret") {
 				errs = append(errs, err)
 				continue
 			} else {
-				return nil, nil, errors.Wrapf(err, "error inspecting secret %s", nameOrID)
+				return nil, nil, fmt.Errorf("inspecting secret %s: %w", nameOrID, err)
 			}
 		}
-		report := &entities.SecretInfoReport{
-			ID:        secret.ID,
-			CreatedAt: secret.CreatedAt,
-			UpdatedAt: secret.CreatedAt,
-			Spec: entities.SecretSpec{
-				Name: secret.Name,
-				Driver: entities.SecretDriverSpec{
-					Name:    secret.Driver,
-					Options: secret.DriverOptions,
-				},
-			},
+		if secret.Labels == nil {
+			secret.Labels = make(map[string]string)
 		}
-		reports = append(reports, report)
+		if secret.UpdatedAt.IsZero() {
+			secret.UpdatedAt = secret.CreatedAt
+		}
+		reports = append(reports, secretToReportWithData(*secret, string(data)))
 	}
 
 	return reports, errs, nil
@@ -101,19 +112,7 @@ func (ic *ContainerEngine) SecretList(ctx context.Context, opts entities.SecretL
 			return nil, err
 		}
 		if result {
-			reportItem := entities.SecretInfoReport{
-				ID:        secret.ID,
-				CreatedAt: secret.CreatedAt,
-				UpdatedAt: secret.CreatedAt,
-				Spec: entities.SecretSpec{
-					Name: secret.Name,
-					Driver: entities.SecretDriverSpec{
-						Name:    secret.Driver,
-						Options: secret.DriverOptions,
-					},
-				},
-			}
-			report = append(report, &reportItem)
+			report = append(report, secretToReport(secret))
 		}
 	}
 	return report, nil
@@ -141,16 +140,46 @@ func (ic *ContainerEngine) SecretRm(ctx context.Context, nameOrIDs []string, opt
 	}
 	for _, nameOrID := range toRemove {
 		deletedID, err := manager.Delete(nameOrID)
-		if err == nil || errors.Cause(err).Error() == "no such secret" {
-			reports = append(reports, &entities.SecretRmReport{
-				Err: err,
-				ID:  deletedID,
-			})
+		if options.Ignore && errors.Is(err, secrets.ErrNoSuchSecret) {
 			continue
-		} else {
-			return nil, err
 		}
+		reports = append(reports, &entities.SecretRmReport{Err: err, ID: deletedID})
 	}
 
 	return reports, nil
+}
+
+func (ic *ContainerEngine) SecretExists(ctx context.Context, nameOrID string) (*entities.BoolReport, error) {
+	manager, err := ic.Libpod.SecretsManager()
+	if err != nil {
+		return nil, err
+	}
+
+	secret, err := manager.Lookup(nameOrID)
+	if err != nil && !errors.Is(err, secrets.ErrNoSuchSecret) {
+		return nil, err
+	}
+
+	return &entities.BoolReport{Value: secret != nil}, nil
+}
+
+func secretToReport(secret secrets.Secret) *entities.SecretInfoReport {
+	return secretToReportWithData(secret, "")
+}
+
+func secretToReportWithData(secret secrets.Secret, data string) *entities.SecretInfoReport {
+	return &entities.SecretInfoReport{
+		ID:        secret.ID,
+		CreatedAt: secret.CreatedAt,
+		UpdatedAt: secret.UpdatedAt,
+		Spec: entities.SecretSpec{
+			Name: secret.Name,
+			Driver: entities.SecretDriverSpec{
+				Name:    secret.Driver,
+				Options: secret.DriverOptions,
+			},
+			Labels: secret.Labels,
+		},
+		SecretData: data,
+	}
 }

@@ -3,17 +3,14 @@ package images
 import (
 	"fmt"
 	"os"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/containers/common/pkg/report"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -132,7 +129,7 @@ func history(cmd *cobra.Command, args []string) error {
 		})
 
 		if err := rpt.Execute(hdrs); err != nil {
-			return errors.Wrapf(err, "failed to write report column headers")
+			return fmt.Errorf("failed to write report column headers: %w", err)
 		}
 	}
 	return rpt.Execute(hr)
@@ -150,9 +147,7 @@ func (h historyReporter) Created() string {
 }
 
 func (h historyReporter) Size() string {
-	s := units.HumanSizeWithPrecision(float64(h.ImageHistoryLayer.Size), 3)
-	i := strings.LastIndexFunc(s, unicode.IsNumber)
-	return s[:i+1] + " " + s[i+1:]
+	return units.HumanSizeWithPrecision(float64(h.ImageHistoryLayer.Size), 3)
 }
 
 func (h historyReporter) CreatedBy() string {
@@ -170,7 +165,7 @@ func (h historyReporter) ID() string {
 }
 
 func (h historyReporter) CreatedAt() string {
-	return time.Unix(h.ImageHistoryLayer.Created.Unix(), 0).UTC().String()
+	return time.Unix(h.ImageHistoryLayer.Created.Unix(), 0).Format(time.RFC3339)
 }
 
 func (h historyReporter) CreatedSince() string {

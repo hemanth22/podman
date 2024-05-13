@@ -9,11 +9,11 @@ import (
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/common/pkg/report"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/parse"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/validate"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/parse"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -22,8 +22,9 @@ var (
 	networklistDescription = `List networks`
 	networklistCommand     = &cobra.Command{
 		Use:               "ls [options]",
+		Aliases:           []string{"list"},
 		Args:              validate.NoArgs,
-		Short:             "network list",
+		Short:             "List networks",
 		Long:              networklistDescription,
 		RunE:              networkList,
 		ValidArgsFunction: completion.AutocompleteNone,
@@ -47,7 +48,7 @@ func networkListFlags(flags *pflag.FlagSet) {
 
 	filterFlagName := "filter"
 	flags.StringArrayVarP(&filters, filterFlagName, "f", nil, "Provide filter values (e.g. 'name=podman')")
-	flags.Bool("noheading", false, "Do not print headers")
+	flags.BoolP("noheading", "n", false, "Do not print headers")
 	_ = networklistCommand.RegisterFlagCompletionFunc(filterFlagName, common.AutocompleteNetworkFilters)
 }
 
@@ -122,36 +123,27 @@ func templateOut(cmd *cobra.Command, responses []types.Network) error {
 		"ID":     "network id",
 	})
 
-	renderHeaders := report.HasTable(networkListOptions.Format)
-	var row string
+	rpt := report.New(os.Stdout, cmd.Name())
+	defer rpt.Flush()
+
+	var err error
 	switch {
-	case cmd.Flags().Changed("format"):
-		row = report.NormalizeFormat(networkListOptions.Format)
+	case cmd.Flag("format").Changed:
+		rpt, err = rpt.Parse(report.OriginUser, networkListOptions.Format)
 	default:
-		// 'podman network ls' equivalent to 'podman network ls --format="table {{.ID}} {{.Name}} {{.Version}} {{.Plugins}}" '
-		row = "{{.ID}}\t{{.Name}}\t{{.Driver}}\n"
-		renderHeaders = true
+		rpt, err = rpt.Parse(report.OriginPodman, "{{range .}}{{.ID}}\t{{.Name}}\t{{.Driver}}\n{{end -}}")
 	}
-	format := report.EnforceRange(row)
-
-	tmpl, err := report.NewTemplate("list").Parse(format)
 	if err != nil {
 		return err
 	}
-
-	w, err := report.NewWriterDefault(os.Stdout)
-	if err != nil {
-		return err
-	}
-	defer w.Flush()
 
 	noHeading, _ := cmd.Flags().GetBool("noheading")
-	if !noHeading && renderHeaders {
-		if err := tmpl.Execute(w, headers); err != nil {
-			return err
+	if rpt.RenderHeaders && !noHeading {
+		if err := rpt.Execute(headers); err != nil {
+			return fmt.Errorf("failed to write report column headers: %w", err)
 		}
 	}
-	return tmpl.Execute(w, nlprs)
+	return rpt.Execute(nlprs)
 }
 
 // ListPrintReports returns the network list report

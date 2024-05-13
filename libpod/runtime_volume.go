@@ -1,12 +1,14 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"context"
+	"errors"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/pkg/domain/entities/reports"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
 )
 
 // Contains the public Runtime API for volumes
@@ -33,7 +35,7 @@ func (r *Runtime) RemoveVolume(ctx context.Context, v *Volume, force bool, timeo
 			return nil
 		}
 	}
-	return r.removeVolume(ctx, v, force, timeout)
+	return r.removeVolume(ctx, v, force, timeout, false)
 }
 
 // GetVolume retrieves a volume given its full name.
@@ -133,7 +135,7 @@ func (r *Runtime) PruneVolumes(ctx context.Context, filterFuncs []VolumeFilter) 
 		report.Id = vol.Name()
 		var timeout *uint
 		if err := r.RemoveVolume(ctx, vol, false, timeout); err != nil {
-			if errors.Cause(err) != define.ErrVolumeBeingUsed && errors.Cause(err) != define.ErrVolumeRemoved {
+			if !errors.Is(err, define.ErrVolumeBeingUsed) && !errors.Is(err, define.ErrVolumeRemoved) {
 				report.Err = err
 			} else {
 				// We didn't remove the volume for some reason

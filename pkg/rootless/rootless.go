@@ -7,8 +7,9 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/lockfile"
-	"github.com/opencontainers/runc/libcontainer/user"
+	"github.com/moby/sys/user"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -16,7 +17,7 @@ import (
 // TryJoinFromFilePaths.  If joining fails, it attempts to delete the specified
 // file.
 func TryJoinPauseProcess(pausePidPath string) (bool, int, error) {
-	if _, err := os.Stat(pausePidPath); err != nil {
+	if err := fileutils.Exists(pausePidPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, -1, nil
 		}
@@ -29,7 +30,7 @@ func TryJoinPauseProcess(pausePidPath string) (bool, int, error) {
 	}
 
 	// It could not join the pause process, let's lock the file before trying to delete it.
-	pidFileLock, err := lockfile.GetLockfile(pausePidPath)
+	pidFileLock, err := lockfile.GetLockFile(pausePidPath)
 	if err != nil {
 		// The file was deleted by another process.
 		if os.IsNotExist(err) {
@@ -40,9 +41,7 @@ func TryJoinPauseProcess(pausePidPath string) (bool, int, error) {
 
 	pidFileLock.Lock()
 	defer func() {
-		if pidFileLock.Locked() {
-			pidFileLock.Unlock()
-		}
+		pidFileLock.Unlock()
 	}()
 
 	// Now the pause PID file is locked.  Try to join once again in case it changed while it was not locked.
@@ -50,7 +49,7 @@ func TryJoinPauseProcess(pausePidPath string) (bool, int, error) {
 	if err != nil {
 		// It is still failing.  We can safely remove it.
 		os.Remove(pausePidPath)
-		return false, -1, nil // nolint: nilerr
+		return false, -1, nil //nolint: nilerr
 	}
 	return became, ret, err
 }
@@ -137,7 +136,7 @@ func GetAvailableGids() (int64, error) {
 	return countAvailableIDs(gids), nil
 }
 
-// findIDInMappings find the the mapping that contains the specified ID.
+// findIDInMappings find the mapping that contains the specified ID.
 // It assumes availableMappings is sorted by ID.
 func findIDInMappings(id int64, availableMappings []user.IDMap) *user.IDMap {
 	i := sort.Search(len(availableMappings), func(i int) bool {

@@ -1,20 +1,20 @@
 package util
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/rootless"
 	"github.com/containers/psgo"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -37,7 +37,9 @@ func FindDeviceNodes() (map[string]string, error) {
 	nodes := make(map[string]string)
 	err := filepath.WalkDir("/dev", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			logrus.Warnf("Error descending into path %s: %v", path, err)
+			if !errors.Is(err, fs.ErrNotExist) {
+				logrus.Warnf("Error descending into path %s: %v", path, err)
+			}
 			return filepath.SkipDir
 		}
 
@@ -48,12 +50,21 @@ func FindDeviceNodes() (map[string]string, error) {
 
 		info, err := d.Info()
 		if err != nil {
-			return err
+			// Info() can return ErrNotExist if the file was deleted between the readdir and stat call.
+			// This race can happen and is no reason to log an ugly error. If this is a container device
+			// that is used the code later will print a proper error in such case.
+			// There also seem to be cases were ErrNotExist is always returned likely due a weird device
+			// state, e.g. removing a device forcefully. This can happen with iSCSI devices.
+			if !errors.Is(err, fs.ErrNotExist) {
+				logrus.Errorf("Failed to get device information for %s: %v", path, err)
+			}
+			// return nil here as we want to continue looking for more device and not stop the WalkDir()
+			return nil
 		}
 		// We are a device node. Get major/minor.
 		sysstat, ok := info.Sys().(*syscall.Stat_t)
 		if !ok {
-			return errors.Errorf("Could not convert stat output for use")
+			return errors.New("could not convert stat output for use")
 		}
 		// We must typeconvert sysstat.Rdev from uint64->int to avoid constant overflow
 		rdev := int(sysstat.Rdev)
@@ -71,7 +82,26 @@ func FindDeviceNodes() (map[string]string, error) {
 	return nodes, nil
 }
 
-func AddPrivilegedDevices(g *generate.Generator) error {
+// isVirtualConsoleDevice returns true if path is a virtual console device
+// (/dev/tty\d+).
+// The passed path must be clean (filepath.Clean).
+func isVirtualConsoleDevice(path string) bool {
+	/*
+		Virtual consoles are of the form `/dev/tty\d+`, any other device such as
+		/dev/tty, ttyUSB0, or ttyACM0 should not be matched.
+		See `man 4 console` for more information.
+	*/
+	suffix := strings.TrimPrefix(path, "/dev/tty")
+	if suffix == path || suffix == "" {
+		return false
+	}
+
+	// 16bit because, max. supported TTY devices is 512 in Linux 6.1.5.
+	_, err := strconv.ParseUint(suffix, 10, 16)
+	return err == nil
+}
+
+func AddPrivilegedDevices(g *generate.Generator, systemdMode bool) error {
 	hostDevices, err := getDevices("/dev")
 	if err != nil {
 		return err
@@ -91,7 +121,19 @@ func AddPrivilegedDevices(g *generate.Generator) error {
 				Source:      d.Path,
 				Options:     []string{"slave", "nosuid", "noexec", "rw", "rbind"},
 			}
-			if d.Path == "/dev/ptmx" || strings.HasPrefix(d.Path, "/dev/tty") {
+
+			/* The following devices should not be mounted in rootless containers:
+			 *
+			 *   /dev/ptmx: The host-provided /dev/ptmx should not be shared to
+			 *              the rootless containers for security reasons, and
+			 *              the container runtime will create it for us
+			 *              anyway (ln -s /dev/pts/ptmx /dev/ptmx);
+			 *   /dev/tty and
+			 *   /dev/tty[0-9]+: Prevent the container from taking over the host's
+			 *                   virtual consoles, even when not in systemd mode
+			 *                   for backwards compatibility.
+			 */
+			if d.Path == "/dev/ptmx" || d.Path == "/dev/tty" || isVirtualConsoleDevice(d.Path) {
 				continue
 			}
 			if _, found := mounts[d.Path]; found {
@@ -105,6 +147,19 @@ func AddPrivilegedDevices(g *generate.Generator) error {
 		}
 	} else {
 		for _, d := range hostDevices {
+			/* Restrict access to the virtual consoles *only* when running
+			 * in systemd mode to improve backwards compatibility. See
+			 * https://github.com/containers/podman/issues/15878.
+			 *
+			 * NOTE: May need revisiting in the future to drop the systemd
+			 * condition if more use cases end up breaking the virtual terminals
+			 * of people who specifically disable the systemd mode. It would
+			 * also provide a more consistent behaviour between rootless and
+			 * rootfull containers.
+			 */
+			if systemdMode && isVirtualConsoleDevice(d.Path) {
+				continue
+			}
 			g.AddDevice(d)
 		}
 		// Add resources device - need to clear the existing one first.
@@ -119,7 +174,7 @@ func AddPrivilegedDevices(g *generate.Generator) error {
 
 // based on getDevices from runc (libcontainer/devices/devices.go)
 func getDevices(path string) ([]spec.LinuxDevice, error) {
-	files, err := ioutil.ReadDir(path)
+	files, err := os.ReadDir(path)
 	if err != nil {
 		if rootless.IsRootless() && os.IsPermission(err) {
 			return nil, nil
@@ -146,7 +201,7 @@ func getDevices(path string) ([]spec.LinuxDevice, error) {
 			}
 		case f.Name() == "console":
 			continue
-		case f.Mode()&os.ModeSymlink != 0:
+		case f.Type()&os.ModeSymlink != 0:
 			continue
 		}
 
@@ -176,7 +231,7 @@ func DeviceFromPath(path string) (*spec.LinuxDevice, error) {
 	var (
 		devType   string
 		mode      = stat.Mode
-		devNumber = uint64(stat.Rdev) // nolint: unconvert
+		devNumber = uint64(stat.Rdev) //nolint: unconvert
 		m         = os.FileMode(mode)
 	)
 

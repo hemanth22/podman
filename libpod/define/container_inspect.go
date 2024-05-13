@@ -1,9 +1,13 @@
 package define
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/containers/image/v5/manifest"
+	"github.com/containers/podman/v5/pkg/signal"
 )
 
 type InspectIDMappings struct {
@@ -44,7 +48,7 @@ type InspectContainerConfig struct {
 	// Container working directory
 	WorkingDir string `json:"WorkingDir"`
 	// Container entrypoint
-	Entrypoint string `json:"Entrypoint"`
+	Entrypoint []string `json:"Entrypoint"`
 	// On-build arguments - presently unused. More of Buildah's domain.
 	OnBuild *string `json:"OnBuild"`
 	// Container labels
@@ -52,9 +56,11 @@ type InspectContainerConfig struct {
 	// Container annotations
 	Annotations map[string]string `json:"Annotations"`
 	// Container stop signal
-	StopSignal uint `json:"StopSignal"`
+	StopSignal string `json:"StopSignal"`
 	// Configured healthcheck for the container
 	Healthcheck *manifest.Schema2HealthConfig `json:"Healthcheck,omitempty"`
+	// HealthcheckOnFailureAction defines an action to take once the container turns unhealthy.
+	HealthcheckOnFailureAction string `json:"HealthcheckOnFailureAction,omitempty"`
 	// CreateCommand is the full command plus arguments of the process the
 	// container has been created with.
 	CreateCommand []string `json:"CreateCommand,omitempty"`
@@ -79,6 +85,55 @@ type InspectContainerConfig struct {
 	// treated as root directories. Standard bind mounts will be mounted
 	// into paths relative to these directories.
 	ChrootDirs []string `json:"ChrootDirs,omitempty"`
+	// SdNotifyMode is the sd-notify mode of the container.
+	SdNotifyMode string `json:"sdNotifyMode,omitempty"`
+	// SdNotifySocket is the NOTIFY_SOCKET in use by/configured for the container.
+	SdNotifySocket string `json:"sdNotifySocket,omitempty"`
+}
+
+// UnmarshalJSON allow compatibility with podman V4 API
+func (insp *InspectContainerConfig) UnmarshalJSON(data []byte) error {
+	type Alias InspectContainerConfig
+	aux := &struct {
+		Entrypoint interface{} `json:"Entrypoint"`
+		StopSignal interface{} `json:"StopSignal"`
+		*Alias
+	}{
+		Alias: (*Alias)(insp),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	switch entrypoint := aux.Entrypoint.(type) {
+	case string:
+		insp.Entrypoint = strings.Split(entrypoint, " ")
+	case []string:
+		insp.Entrypoint = entrypoint
+	case []interface{}:
+		insp.Entrypoint = []string{}
+		for _, entry := range entrypoint {
+			if str, ok := entry.(string); ok {
+				insp.Entrypoint = append(insp.Entrypoint, str)
+			}
+		}
+	case nil:
+		insp.Entrypoint = []string{}
+	default:
+		return fmt.Errorf("cannot unmarshal Config.Entrypoint of type  %T", entrypoint)
+	}
+
+	switch stopsignal := aux.StopSignal.(type) {
+	case string:
+		insp.StopSignal = stopsignal
+	case float64:
+		insp.StopSignal = signal.ToDockerFormat(uint(stopsignal))
+	case nil:
+		break
+	default:
+		return fmt.Errorf("cannot unmarshal Config.StopSignal of type  %T", stopsignal)
+	}
+	return nil
 }
 
 // InspectRestartPolicy holds information about the container's restart policy.
@@ -200,39 +255,40 @@ type InspectMount struct {
 // Docker, but here we see more fields that are unused (nonsensical in the
 // context of Libpod).
 type InspectContainerState struct {
-	OciVersion     string             `json:"OciVersion"`
-	Status         string             `json:"Status"`
-	Running        bool               `json:"Running"`
-	Paused         bool               `json:"Paused"`
-	Restarting     bool               `json:"Restarting"` // TODO
-	OOMKilled      bool               `json:"OOMKilled"`
-	Dead           bool               `json:"Dead"`
-	Pid            int                `json:"Pid"`
-	ConmonPid      int                `json:"ConmonPid,omitempty"`
-	ExitCode       int32              `json:"ExitCode"`
-	Error          string             `json:"Error"` // TODO
-	StartedAt      time.Time          `json:"StartedAt"`
-	FinishedAt     time.Time          `json:"FinishedAt"`
-	Health         HealthCheckResults `json:"Health,omitempty"`
-	Checkpointed   bool               `json:"Checkpointed,omitempty"`
-	CgroupPath     string             `json:"CgroupPath,omitempty"`
-	CheckpointedAt time.Time          `json:"CheckpointedAt,omitempty"`
-	RestoredAt     time.Time          `json:"RestoredAt,omitempty"`
-	CheckpointLog  string             `json:"CheckpointLog,omitempty"`
-	CheckpointPath string             `json:"CheckpointPath,omitempty"`
-	RestoreLog     string             `json:"RestoreLog,omitempty"`
-	Restored       bool               `json:"Restored,omitempty"`
+	OciVersion     string              `json:"OciVersion"`
+	Status         string              `json:"Status"`
+	Running        bool                `json:"Running"`
+	Paused         bool                `json:"Paused"`
+	Restarting     bool                `json:"Restarting"` // TODO
+	OOMKilled      bool                `json:"OOMKilled"`
+	Dead           bool                `json:"Dead"`
+	Pid            int                 `json:"Pid"`
+	ConmonPid      int                 `json:"ConmonPid,omitempty"`
+	ExitCode       int32               `json:"ExitCode"`
+	Error          string              `json:"Error"` // TODO
+	StartedAt      time.Time           `json:"StartedAt"`
+	FinishedAt     time.Time           `json:"FinishedAt"`
+	Health         *HealthCheckResults `json:"Health,omitempty"`
+	Checkpointed   bool                `json:"Checkpointed,omitempty"`
+	CgroupPath     string              `json:"CgroupPath,omitempty"`
+	CheckpointedAt time.Time           `json:"CheckpointedAt,omitempty"`
+	RestoredAt     time.Time           `json:"RestoredAt,omitempty"`
+	CheckpointLog  string              `json:"CheckpointLog,omitempty"`
+	CheckpointPath string              `json:"CheckpointPath,omitempty"`
+	RestoreLog     string              `json:"RestoreLog,omitempty"`
+	Restored       bool                `json:"Restored,omitempty"`
+	StoppedByUser  bool                `json:"StoppedByUser,omitempty"`
 }
 
 // Healthcheck returns the HealthCheckResults. This is used for old podman compat
 // to make the "Healthcheck" key available in the go template.
-func (s *InspectContainerState) Healthcheck() HealthCheckResults {
+func (s *InspectContainerState) Healthcheck() *HealthCheckResults {
 	return s.Health
 }
 
 // HealthCheckResults describes the results/logs from a healthcheck
 type HealthCheckResults struct {
-	// Status healthy or unhealthy
+	// Status starting, healthy or unhealthy
 	Status string `json:"Status"`
 	// FailingStreak is the number of consecutive failed healthchecks
 	FailingStreak int `json:"FailingStreak"`
@@ -259,9 +315,8 @@ type HealthCheckLog struct {
 // as possible from the spec and container config.
 // Some things cannot be inferred. These will be populated by spec annotations
 // (if available).
-// Field names are fixed for compatibility and cannot be changed.
-// As such, silence lint warnings about them.
-//nolint
+//
+//nolint:revive,stylecheck // Field names are fixed for compatibility and cannot be changed.
 type InspectContainerHostConfig struct {
 	// Binds contains an array of user-added mounts.
 	// Both volume mounts and named volumes are included.
@@ -309,6 +364,9 @@ type InspectContainerHostConfig struct {
 	// It is not handled directly within libpod and is stored in an
 	// annotation.
 	AutoRemove bool `json:"AutoRemove"`
+	// Annotations are provided to the runtime when the container is
+	// started.
+	Annotations map[string]string `json:"Annotations"`
 	// VolumeDriver is presently unused and is retained for Docker
 	// compatibility.
 	VolumeDriver string `json:"VolumeDriver"`
@@ -336,7 +394,7 @@ type InspectContainerHostConfig struct {
 	// DnsSearch is a list of DNS search domains that will be set in the
 	// container's resolv.conf
 	DnsSearch []string `json:"DnsSearch"`
-	// ExtraHosts contains hosts that will be aded to the container's
+	// ExtraHosts contains hosts that will be added to the container's
 	// /etc/hosts.
 	ExtraHosts []string `json:"ExtraHosts"`
 	// GroupAdd contains groups that the user inside the container will be
@@ -508,8 +566,8 @@ type InspectContainerHostConfig struct {
 	// CpuRealtimeRuntime is the length of time (in microseconds) allocated
 	// for realtime tasks within every CpuRealtimePeriod.
 	CpuRealtimeRuntime int64 `json:"CpuRealtimeRuntime"`
-	// CpusetCpus is the is the set of CPUs that the container will execute
-	// on. Formatted as `0-3` or `0,2`. Default (if unset) is all CPUs.
+	// CpusetCpus is the set of CPUs that the container will execute on.
+	// Formatted as `0-3` or `0,2`. Default (if unset) is all CPUs.
 	CpusetCpus string `json:"CpusetCpus"`
 	// CpusetMems is the set of memory nodes the container will use.
 	// Formatted as `0-3` or `0,2`. Default (if unset) is all memory nodes.
@@ -546,7 +604,7 @@ type InspectContainerHostConfig struct {
 	OomKillDisable bool `json:"OomKillDisable"`
 	// Init indicates whether the container has an init mounted into it.
 	Init bool `json:"Init,omitempty"`
-	// PidsLimit is the maximum number of PIDs what may be created within
+	// PidsLimit is the maximum number of PIDs that may be created within
 	// the container. 0, the default, indicates no limit.
 	PidsLimit int64 `json:"PidsLimit"`
 	// Ulimits is a set of ulimits that will be set within the container.
@@ -561,6 +619,9 @@ type InspectContainerHostConfig struct {
 	IOMaximumBandwidth uint64 `json:"IOMaximumBandwidth"`
 	// CgroupConf is the configuration for cgroup v2.
 	CgroupConf map[string]string `json:"CgroupConf"`
+	// IntelRdtClosID defines the Intel RDT CAT Class Of Service (COS) that
+	// all processes of the container should run in.
+	IntelRdtClosID string `json:"IntelRdtClosID,omitempty"`
 }
 
 // Address represents an IP address.
@@ -601,7 +662,7 @@ type InspectBasicNetworkConfig struct {
 	AdditionalMacAddresses []string `json:"AdditionalMACAddresses,omitempty"`
 }
 
-// InspectAdditionalNetwork holds information about non-default CNI networks the
+// InspectAdditionalNetwork holds information about non-default networks the
 // container has been connected to.
 // As with InspectNetworkSettings, many fields are unused and maintained only
 // for compatibility with Docker.
@@ -637,7 +698,7 @@ type InspectNetworkSettings struct {
 	LinkLocalIPv6PrefixLen int                          `json:"LinkLocalIPv6PrefixLen"`
 	Ports                  map[string][]InspectHostPort `json:"Ports"`
 	SandboxKey             string                       `json:"SandboxKey"`
-	// Networks contains information on non-default CNI networks this
+	// Networks contains information on non-default networks this
 	// container has joined.
 	// It is a map of network name to network information.
 	Networks map[string]*InspectAdditionalNetwork `json:"Networks,omitempty"`
@@ -649,43 +710,46 @@ type InspectNetworkSettings struct {
 // compatible with `docker inspect` JSON, but additional fields have been added
 // as required to share information not in the original output.
 type InspectContainerData struct {
-	ID              string                      `json:"Id"`
-	Created         time.Time                   `json:"Created"`
-	Path            string                      `json:"Path"`
-	Args            []string                    `json:"Args"`
-	State           *InspectContainerState      `json:"State"`
-	Image           string                      `json:"Image"`
-	ImageName       string                      `json:"ImageName"`
-	Rootfs          string                      `json:"Rootfs"`
-	Pod             string                      `json:"Pod"`
-	ResolvConfPath  string                      `json:"ResolvConfPath"`
-	HostnamePath    string                      `json:"HostnamePath"`
-	HostsPath       string                      `json:"HostsPath"`
-	StaticDir       string                      `json:"StaticDir"`
-	OCIConfigPath   string                      `json:"OCIConfigPath,omitempty"`
-	OCIRuntime      string                      `json:"OCIRuntime,omitempty"`
-	ConmonPidFile   string                      `json:"ConmonPidFile"`
-	PidFile         string                      `json:"PidFile"`
-	Name            string                      `json:"Name"`
-	RestartCount    int32                       `json:"RestartCount"`
-	Driver          string                      `json:"Driver"`
-	MountLabel      string                      `json:"MountLabel"`
-	ProcessLabel    string                      `json:"ProcessLabel"`
-	AppArmorProfile string                      `json:"AppArmorProfile"`
-	EffectiveCaps   []string                    `json:"EffectiveCaps"`
-	BoundingCaps    []string                    `json:"BoundingCaps"`
-	ExecIDs         []string                    `json:"ExecIDs"`
-	GraphDriver     *DriverData                 `json:"GraphDriver"`
-	SizeRw          *int64                      `json:"SizeRw,omitempty"`
-	SizeRootFs      int64                       `json:"SizeRootFs,omitempty"`
-	Mounts          []InspectMount              `json:"Mounts"`
-	Dependencies    []string                    `json:"Dependencies"`
-	NetworkSettings *InspectNetworkSettings     `json:"NetworkSettings"`
-	Namespace       string                      `json:"Namespace"`
-	IsInfra         bool                        `json:"IsInfra"`
-	IsService       bool                        `json:"IsService"`
-	Config          *InspectContainerConfig     `json:"Config"`
-	HostConfig      *InspectContainerHostConfig `json:"HostConfig"`
+	ID                      string                      `json:"Id"`
+	Created                 time.Time                   `json:"Created"`
+	Path                    string                      `json:"Path"`
+	Args                    []string                    `json:"Args"`
+	State                   *InspectContainerState      `json:"State"`
+	Image                   string                      `json:"Image"`
+	ImageDigest             string                      `json:"ImageDigest"`
+	ImageName               string                      `json:"ImageName"`
+	Rootfs                  string                      `json:"Rootfs"`
+	Pod                     string                      `json:"Pod"`
+	ResolvConfPath          string                      `json:"ResolvConfPath"`
+	HostnamePath            string                      `json:"HostnamePath"`
+	HostsPath               string                      `json:"HostsPath"`
+	StaticDir               string                      `json:"StaticDir"`
+	OCIConfigPath           string                      `json:"OCIConfigPath,omitempty"`
+	OCIRuntime              string                      `json:"OCIRuntime,omitempty"`
+	ConmonPidFile           string                      `json:"ConmonPidFile"`
+	PidFile                 string                      `json:"PidFile"`
+	Name                    string                      `json:"Name"`
+	RestartCount            int32                       `json:"RestartCount"`
+	Driver                  string                      `json:"Driver"`
+	MountLabel              string                      `json:"MountLabel"`
+	ProcessLabel            string                      `json:"ProcessLabel"`
+	AppArmorProfile         string                      `json:"AppArmorProfile"`
+	EffectiveCaps           []string                    `json:"EffectiveCaps"`
+	BoundingCaps            []string                    `json:"BoundingCaps"`
+	ExecIDs                 []string                    `json:"ExecIDs"`
+	GraphDriver             *DriverData                 `json:"GraphDriver"`
+	SizeRw                  *int64                      `json:"SizeRw,omitempty"`
+	SizeRootFs              int64                       `json:"SizeRootFs,omitempty"`
+	Mounts                  []InspectMount              `json:"Mounts"`
+	Dependencies            []string                    `json:"Dependencies"`
+	NetworkSettings         *InspectNetworkSettings     `json:"NetworkSettings"`
+	Namespace               string                      `json:"Namespace"`
+	IsInfra                 bool                        `json:"IsInfra"`
+	IsService               bool                        `json:"IsService"`
+	KubeExitCodePropagation string                      `json:"KubeExitCodePropagation"`
+	LockNumber              uint32                      `json:"lockNumber"`
+	Config                  *InspectContainerConfig     `json:"Config"`
+	HostConfig              *InspectContainerHostConfig `json:"HostConfig"`
 }
 
 // InspectExecSession contains information about a given exec session.

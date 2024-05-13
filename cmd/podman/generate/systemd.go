@@ -1,19 +1,20 @@
-package pods
+package generate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/common/pkg/report"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	systemDefine "github.com/containers/podman/v4/pkg/systemd/define"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	envLib "github.com/containers/podman/v5/pkg/env"
+	systemDefine "github.com/containers/podman/v5/pkg/systemd/define"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -28,9 +29,18 @@ const (
 	wantsFlagName             = "wants"
 	afterFlagName             = "after"
 	requiresFlagName          = "requires"
+	envFlagName               = "env"
 )
 
 var (
+	deprecation = `
+DEPRECATED command:
+It is recommended to use Quadlets for running containers and pods under systemd.
+
+Please refer to podman-systemd.unit(5) for details.
+`
+
+	envInput           []string
 	files              bool
 	format             string
 	systemdRestart     string
@@ -39,11 +49,12 @@ var (
 	stopTimeout        uint
 	systemdOptions     = entities.GenerateSystemdOptions{}
 	systemdDescription = `Generate systemd units for a pod or container.
-  The generated units can later be controlled via systemctl(1).`
+  The generated units can later be controlled via systemctl(1).
+` + deprecation
 
 	systemdCmd = &cobra.Command{
 		Use:               "systemd [options] {CONTAINER|POD}",
-		Short:             "Generate systemd units.",
+		Short:             "[DEPRECATED] Generate systemd units",
 		Long:              systemdDescription,
 		RunE:              systemd,
 		Args:              cobra.ExactArgs(1),
@@ -57,7 +68,7 @@ var (
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
 		Command: systemdCmd,
-		Parent:  generateCmd,
+		Parent:  GenerateCmd,
 	})
 	flags := systemdCmd.Flags()
 	flags.BoolVarP(&systemdOptions.Name, "name", "n", false, "Use container/pod names instead of IDs")
@@ -109,10 +120,14 @@ func init() {
 	flags.StringArrayVar(&systemdOptions.Requires, requiresFlagName, nil, "Similar to wants, but declares stronger requirement dependencies")
 	_ = systemdCmd.RegisterFlagCompletionFunc(requiresFlagName, completion.AutocompleteNone)
 
+	flags.StringArrayVarP(&envInput, envFlagName, "e", nil, "Set environment variables to the systemd unit files")
+	_ = systemdCmd.RegisterFlagCompletionFunc(envFlagName, completion.AutocompleteNone)
+
 	flags.SetNormalizeFunc(utils.TimeoutAliasFlags)
 }
 
 func systemd(cmd *cobra.Command, args []string) error {
+	fmt.Fprint(os.Stderr, deprecation)
 	if cmd.Flags().Changed(restartPolicyFlagName) {
 		systemdOptions.RestartPolicy = &systemdRestart
 	}
@@ -141,6 +156,13 @@ func systemd(cmd *cobra.Command, args []string) error {
 	if cmd.Flags().Changed(stopTimeoutCompatFlagName) {
 		setStopTimeout++
 	}
+	if cmd.Flags().Changed(envFlagName) {
+		cliEnv, err := envLib.ParseSlice(envInput)
+		if err != nil {
+			return fmt.Errorf("parsing environment variables: %w", err)
+		}
+		systemdOptions.AdditionalEnvVariables = envLib.Slice(cliEnv)
+	}
 	switch setStopTimeout {
 	case 1:
 		systemdOptions.StopTimeout = &stopTimeout
@@ -156,7 +178,7 @@ func systemd(cmd *cobra.Command, args []string) error {
 	if files {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return errors.Wrap(err, "error getting current working directory")
+			return fmt.Errorf("getting current working directory: %w", err)
 		}
 		for name, content := range reports.Units {
 			path := filepath.Join(cwd, fmt.Sprintf("%s.service", name))
@@ -189,7 +211,7 @@ func systemd(cmd *cobra.Command, args []string) error {
 	case format == "":
 		return printDefault(reports.Units)
 	default:
-		return errors.Errorf("unknown --format argument: %s", format)
+		return fmt.Errorf("unknown --format argument: %s", format)
 	}
 }
 

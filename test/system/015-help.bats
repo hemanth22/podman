@@ -17,6 +17,11 @@ function check_help() {
     local -A found
 
     for cmd in $(_podman_commands "$@"); do
+        # Skip the compose command which is calling `docker-compose --help`
+        # and hence won't match the assumptions made below.
+        if [[ "$cmd" == "compose" ]]; then
+            continue
+        fi
         # Human-readable podman command string, with multiple spaces collapsed
         command_string="podman $* $cmd"
         command_string=${command_string//  / }  # 'podman  x' -> 'podman x'
@@ -121,7 +126,7 @@ function check_help() {
             # Exceptions: these commands don't work rootless
             if is_rootless; then
                 # "pause is not supported for rootless containers"
-                if [ "$cmd" = "pause" -o "$cmd" = "unpause" ]; then
+                if [[ "$cmd" = "pause" ]] || [[ "$cmd" = "unpause" ]]; then
                     continue
                 fi
                 # "network rm" too
@@ -162,17 +167,17 @@ function check_help() {
 
     # Any command that takes subcommands, prints its help and errors if called
     # without one.
-    dprint "podman $@"
+    dprint "podman $*"
     run_podman '?' "$@"
     is "$status" 125 "'podman $*' without any subcommand - exit status"
-    is "$output" ".*Usage:.*Error: missing command '.*$@ COMMAND'" \
+    is "$output" ".*Usage:.*Error: missing command '.*$* COMMAND'" \
        "'podman $*' without any subcommand - expected error message"
 
     # Assume that 'NoSuchCommand' is not a command
-    dprint "podman $@ NoSuchCommand"
+    dprint "podman $* NoSuchCommand"
     run_podman '?' "$@" NoSuchCommand
     is "$status" 125 "'podman $* NoSuchCommand' - exit status"
-    is "$output" "Error: unrecognized command .*$@ NoSuchCommand" \
+    is "$output" "Error: unrecognized command .*$* NoSuchCommand" \
        "'podman $* NoSuchCommand' - expected error message"
 
     # This can happen if the output of --help changes, such as between
@@ -199,7 +204,7 @@ function check_help() {
     check_help
 
     # Test for regression of #7273 (spurious "--remote" help on output)
-    for helpopt in help --help; do
+    for helpopt in help --help -h; do
         run_podman $helpopt
         is "${lines[0]}" "Manage pods, containers and images" \
            "podman $helpopt: first line of output"

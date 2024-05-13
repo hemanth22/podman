@@ -2,23 +2,32 @@
 
 # Podman command to run; may be podman-remote
 PODMAN=${PODMAN:-podman}
+QUADLET=${QUADLET:-/usr/libexec/podman/quadlet}
+
+# crun or runc, unlikely to change. Cache, because it's expensive to determine.
+PODMAN_RUNTIME=
 
 # Standard image to use for most tests
 PODMAN_TEST_IMAGE_REGISTRY=${PODMAN_TEST_IMAGE_REGISTRY:-"quay.io"}
 PODMAN_TEST_IMAGE_USER=${PODMAN_TEST_IMAGE_USER:-"libpod"}
 PODMAN_TEST_IMAGE_NAME=${PODMAN_TEST_IMAGE_NAME:-"testimage"}
-PODMAN_TEST_IMAGE_TAG=${PODMAN_TEST_IMAGE_TAG:-"20210610"}
+PODMAN_TEST_IMAGE_TAG=${PODMAN_TEST_IMAGE_TAG:-"20240123"}
 PODMAN_TEST_IMAGE_FQN="$PODMAN_TEST_IMAGE_REGISTRY/$PODMAN_TEST_IMAGE_USER/$PODMAN_TEST_IMAGE_NAME:$PODMAN_TEST_IMAGE_TAG"
-PODMAN_TEST_IMAGE_ID=
+
+# Larger image containing systemd tools.
+PODMAN_SYSTEMD_IMAGE_NAME=${PODMAN_SYSTEMD_IMAGE_NAME:-"systemd-image"}
+PODMAN_SYSTEMD_IMAGE_TAG=${PODMAN_SYSTEMD_IMAGE_TAG:-"20240124"}
+PODMAN_SYSTEMD_IMAGE_FQN="$PODMAN_TEST_IMAGE_REGISTRY/$PODMAN_TEST_IMAGE_USER/$PODMAN_SYSTEMD_IMAGE_NAME:$PODMAN_SYSTEMD_IMAGE_TAG"
 
 # Remote image that we *DO NOT* fetch or keep by default; used for testing pull
 # This has changed in 2021, from 0 through 3, various iterations of getting
 # multiarch to work. It should change only very rarely.
-PODMAN_NONLOCAL_IMAGE_TAG=${PODMAN_NONLOCAL_IMAGE_TAG:-"00000003"}
+PODMAN_NONLOCAL_IMAGE_TAG=${PODMAN_NONLOCAL_IMAGE_TAG:-"00000004"}
 PODMAN_NONLOCAL_IMAGE_FQN="$PODMAN_TEST_IMAGE_REGISTRY/$PODMAN_TEST_IMAGE_USER/$PODMAN_TEST_IMAGE_NAME:$PODMAN_NONLOCAL_IMAGE_TAG"
 
 # Because who wants to spell that out each time?
 IMAGE=$PODMAN_TEST_IMAGE_FQN
+SYSTEMD_IMAGE=$PODMAN_SYSTEMD_IMAGE_FQN
 
 # Default timeout for a podman command.
 PODMAN_TIMEOUT=${PODMAN_TIMEOUT:-120}
@@ -30,25 +39,102 @@ if [ $(id -u) -eq 0 ]; then
 fi
 
 ###############################################################################
+# BEGIN tools for fetching & caching test images
+#
+# Registries are flaky: any time we have to pull an image, that's a risk.
+#
+
+# Store in a semipermanent location. Not important for CI, but nice for
+# developers so test restarts don't hang fetching images.
+export PODMAN_IMAGECACHE=${BATS_TMPDIR:-/tmp}/podman-systest-imagecache-$(id -u)
+mkdir -p ${PODMAN_IMAGECACHE}
+
+function _prefetch() {
+     local want=$1
+
+     # Do we already have it in image store?
+     run_podman '?' image exists "$want"
+     if [[ $status -eq 0 ]]; then
+         return
+     fi
+
+    # No image. Do we have it already cached? (Replace / and : with --)
+    local cachename=$(sed -e 's;[/:];--;g' <<<"$want")
+    local cachepath="${PODMAN_IMAGECACHE}/${cachename}.tar"
+    if [[ ! -e "$cachepath" ]]; then
+        # Not cached. Fetch it and cache it. Retry twice, because of flakes.
+        cmd="skopeo copy --preserve-digests docker://$want oci-archive:$cachepath"
+        echo "$_LOG_PROMPT $cmd"
+        run $cmd
+        echo "$output"
+        if [[ $status -ne 0 ]]; then
+            echo "# 'pull $want' failed, will retry..." >&3
+            sleep 5
+
+            run $cmd
+            echo "$output"
+            if [[ $status -ne 0 ]]; then
+                echo "# 'pull $want' failed again, will retry one last time..." >&3
+                sleep 30
+                $cmd
+            fi
+        fi
+    fi
+
+    # Kludge alert.
+    # Skopeo has no --storage-driver, --root, or --runroot flags; those
+    # need to be expressed in the destination string inside [brackets].
+    # See containers-transports(5). So if we see those options in
+    # _PODMAN_TEST_OPTS, transmogrify $want into skopeo form.
+    skopeo_opts=''
+    driver="$(expr "$_PODMAN_TEST_OPTS" : ".*--storage-driver \([^ ]\+\)" || true)"
+    if [[ -n "$driver" ]]; then
+        skopeo_opts+="$driver@"
+    fi
+
+    altroot="$(expr "$_PODMAN_TEST_OPTS" : ".*--root \([^ ]\+\)" || true)"
+    if [[ -n "$altroot" ]] && [[ -d "$altroot" ]]; then
+        skopeo_opts+="$altroot"
+
+        altrunroot="$(expr "$_PODMAN_TEST_OPTS" : ".*--runroot \([^ ]\+\)" || true)"
+        if [[ -n "$altrunroot" ]] && [[ -d "$altrunroot" ]]; then
+            skopeo_opts+="+$altrunroot"
+        fi
+    fi
+
+    if [[ -n "$skopeo_opts" ]]; then
+        want="[$skopeo_opts]$want"
+    fi
+
+    # Cached image is now guaranteed to exist. Be sure to load it
+    # with skopeo, not podman, in order to preserve metadata
+    cmd="skopeo copy --all oci-archive:$cachepath containers-storage:$want"
+    echo "$_LOG_PROMPT $cmd"
+    $cmd
+}
+
+
+# Wrapper for skopeo, because skopeo doesn't work rootless if $XDG is unset
+# (as it is in RHEL gating): it defaults to /run/containers/<uid>, which
+# of course is a root-only dir, hence fails with permission denied.
+# -- https://github.com/containers/skopeo/issues/823
+function skopeo() {
+    local xdg=${XDG_RUNTIME_DIR}
+    if [ -z "$xdg" ]; then
+        if is_rootless; then
+            xdg=/run/user/$(id -u)
+        fi
+    fi
+    XDG_RUNTIME_DIR=${xdg} command skopeo "$@"
+}
+
+# END   tools for fetching & caching test images
+###############################################################################
 # BEGIN setup/teardown tools
 
 # Provide common setup and teardown functions, but do not name them such!
 # That way individual tests can override with their own setup/teardown,
 # while retaining the ability to include these if they so desire.
-
-# Some CI systems set this to runc, overriding the default crun.
-if [[ -n $OCI_RUNTIME ]]; then
-    if [[ -z $CONTAINERS_CONF ]]; then
-        # FIXME: BATS provides no mechanism for end-of-run cleanup[1]; how
-        # can we avoid leaving this file behind when we finish?
-        #   [1] https://github.com/bats-core/bats-core/issues/39
-        export CONTAINERS_CONF=$(mktemp --tmpdir=${BATS_TMPDIR:-/tmp} podman-bats-XXXXXXX.containers.conf)
-        cat >$CONTAINERS_CONF <<EOF
-[engine]
-runtime="$OCI_RUNTIME"
-EOF
-    fi
-fi
 
 # Setup helper: establish a test environment with exactly the images needed
 function basic_setup() {
@@ -60,20 +146,34 @@ function basic_setup() {
     for line in "${lines[@]}"; do
         set $line
         echo "# setup(): removing stray external container $1 ($2)" >&3
-        run_podman rm -f $1
+        run_podman '?' rm -f $1
+        if [[ $status -ne 0 ]]; then
+            echo "# [setup] $_LOG_PROMPT podman rm -f $1" >&3
+            for errline in "${lines[@]}"; do
+                echo "# $errline" >&3
+            done
+        fi
     done
 
-    # Clean up all images except those desired
+    # Clean up all images except those desired.
+    # 2023-06-26 REMINDER: it is tempting to think that this is clunky,
+    # wouldn't it be safer/cleaner to just 'rmi -a' then '_prefetch $IMAGE'?
+    # Yes, but it's also tremendously slower: 29m for a CI run, to 39m.
+    # Image loads are slow.
     found_needed_image=
-    run_podman images --all --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+    run_podman '?' images --all --format '{{.Repository}}:{{.Tag}} {{.ID}}'
+
     for line in "${lines[@]}"; do
         set $line
-        if [ "$1" == "$PODMAN_TEST_IMAGE_FQN" ]; then
+        if [[ "$1" == "$PODMAN_TEST_IMAGE_FQN" ]]; then
             if [[ -z "$PODMAN_TEST_IMAGE_ID" ]]; then
                 # This will probably only trigger the 2nd time through setup
                 PODMAN_TEST_IMAGE_ID=$2
             fi
             found_needed_image=1
+        elif [[ "$1" == "$PODMAN_SYSTEMD_IMAGE_FQN" ]]; then
+            # This is a big image, don't force unnecessary pulls
+            :
         else
             # Always remove image that doesn't match by name
             echo "# setup(): removing stray image $1" >&3
@@ -87,30 +187,106 @@ function basic_setup() {
         fi
     done
 
-    # Make sure desired images are present
-    if [ -z "$found_needed_image" ]; then
-        run_podman pull "$PODMAN_TEST_IMAGE_FQN"
+    # Make sure desired image is present
+    if [[ -z "$found_needed_image" ]]; then
+        _prefetch $PODMAN_TEST_IMAGE_FQN
     fi
 
-    # Argh. Although BATS provides $BATS_TMPDIR, it's just /tmp!
-    # That's bloody worthless. Let's make our own, in which subtests
-    # can write whatever they like and trust that it'll be deleted
-    # on cleanup.
-    # TODO: do this outside of setup, so it carries across tests?
+    # Temporary subdirectory, in which tests can write whatever they like
+    # and trust that it'll be deleted on cleanup.
+    # (BATS v1.3 and above provide $BATS_TEST_TMPDIR, but we still use
+    # ancient BATS (v1.1) in RHEL gating tests.)
     PODMAN_TMPDIR=$(mktemp -d --tmpdir=${BATS_TMPDIR:-/tmp} podman_bats.XXXXXX)
+
+    # runtime is not likely to change
+    if [[ -z "$PODMAN_RUNTIME" ]]; then
+        PODMAN_RUNTIME=$(podman_runtime)
+    fi
 
     # In the unlikely event that a test runs is() before a run_podman()
     MOST_RECENT_PODMAN_COMMAND=
+
+    # Test filenames must match ###-name.bats; use "[###] " as prefix
+    run expr "$BATS_TEST_FILENAME" : "^.*/\([0-9]\{3\}\)-[^/]\+\.bats\$"
+    BATS_TEST_NAME_PREFIX="[${output}] "
+
+    # By default, assert() and die() cause an immediate test failure.
+    # Under special circumstances (usually long test loops), tests
+    # can call defer-assertion-failures() to continue going, the
+    # idea being that a large number of failures can show patterns.
+    ASSERTION_FAILURES=
+    immediate-assertion-failures
+}
+
+# bail-now is how we terminate a test upon assertion failure.
+# By default, and the vast majority of the time, it just triggers
+# immediate test termination; but see defer-assertion-failures, below.
+function bail-now() {
+    # "false" does not apply to "bail now"! It means "nonzero exit",
+    # which BATS interprets as "yes, bail immediately".
+    false
+}
+
+# Invoked on teardown: will terminate immediately if there have been
+# any deferred test failures; otherwise will reset back to immediate
+# test termination on future assertions.
+function immediate-assertion-failures() {
+    function bail-now() {
+        false
+    }
+
+    # Any backlog?
+    if [[ -n "$ASSERTION_FAILURES" ]]; then
+        local n=${#ASSERTION_FAILURES}
+        ASSERTION_FAILURES=
+        die "$n test assertions failed. Search for 'FAIL:' above this line." >&2
+    fi
+}
+
+# Used in special test circumstances--typically multi-condition loops--to
+# continue going even on assertion failures. The test will fail afterward,
+# usually in teardown. This can be useful to show failure patterns.
+function defer-assertion-failures() {
+    function bail-now() {
+        ASSERTION_FAILURES+="!"
+    }
 }
 
 # Basic teardown: remove all pods and containers
 function basic_teardown() {
     echo "# [teardown]" >&2
-    run_podman '?' pod rm -t 0 --all --force --ignore
-    run_podman '?'     rm -t 0 --all --force --ignore
-    run_podman '?' network prune --force
+    local actions=(
+        "pod rm -t 0 --all --force --ignore"
+            "rm -t 0 --all --force --ignore"
+        "network prune --force"
+        "volume rm -a -f"
+    )
+    for action in "${actions[@]}"; do
+        run_podman '?' $action
+
+        # The -f commands should never exit nonzero, but if they do we want
+        # to know about it.
+        #   FIXME: someday: also test for [[ -n "$output" ]] - can't do this
+        #   yet because too many tests don't clean up their containers
+        if [[ $status -ne 0 ]]; then
+            echo "# [teardown] $_LOG_PROMPT podman $action" >&3
+            for line in "${lines[*]}"; do
+                echo "# $line" >&3
+            done
+
+            # Special case for timeout: check for locks (#18514)
+            if [[ $status -eq 124 ]]; then
+                echo "# [teardown] $_LOG_PROMPT podman system locks" >&3
+                run $PODMAN system locks
+                for line in "${lines[*]}"; do
+                    echo "# $line" >&3
+                done
+            fi
+        fi
+    done
 
     command rm -rf $PODMAN_TMPDIR
+    immediate-assertion-failures
 }
 
 
@@ -148,6 +324,11 @@ function restore_image() {
 ###############################################################################
 # BEGIN podman helpers
 
+# Displays '[HH:MM:SS.NNNNN]' in command output. logformatter relies on this.
+function timestamp() {
+    date +'[%T.%N]'
+}
+
 ################
 #  run_podman  #  Invoke $PODMAN, with timeout, using BATS 'run'
 ################
@@ -172,8 +353,11 @@ function restore_image() {
 #
 function run_podman() {
     # Number as first argument = expected exit code; default 0
-    expected_rc=0
+    # "0+[we]" = require success, but allow warnings/errors
+    local expected_rc=0
+    local allowed_levels="dit"
     case "$1" in
+        0\+[we]*)        allowed_levels+=$(expr "$1" : "^0+\([we]\+\)"); shift;;
         [0-9])           expected_rc=$1; shift;;
         [1-9][0-9])      expected_rc=$1; shift;;
         [12][0-9][0-9])  expected_rc=$1; shift;;
@@ -183,17 +367,37 @@ function run_podman() {
     # Remember command args, for possible use in later diagnostic messages
     MOST_RECENT_PODMAN_COMMAND="podman $*"
 
-    # stdout is only emitted upon error; this echo is to help a debugger
-    echo "$_LOG_PROMPT $PODMAN $*"
+    # BATS >= 1.5.0 treats 127 as a special case, adding a big nasty warning
+    # at the end of the test run if any command exits thus. Silence it.
+    #   https://bats-core.readthedocs.io/en/stable/warnings/BW01.html
+    local silence127=
+    if [[ "$expected_rc" = "127" ]]; then
+        # We could use "-127", but that would cause BATS to fail if the
+        # command exits any other status -- and default BATS failure messages
+        # are much less helpful than the run_podman ones. "!" is more flexible.
+        silence127="!"
+    fi
+
+    # stdout is only emitted upon error; this printf is to help in debugging
+    printf "\n%s %s %s %s\n" "$(timestamp)" "$_LOG_PROMPT" "$PODMAN" "$*"
     # BATS hangs if a subprocess remains and keeps FD 3 open; this happens
     # if podman crashes unexpectedly without cleaning up subprocesses.
-    run timeout --foreground -v --kill=10 $PODMAN_TIMEOUT $PODMAN $_PODMAN_TEST_OPTS "$@" 3>/dev/null
+    run $silence127 timeout --foreground -v --kill=10 $PODMAN_TIMEOUT $PODMAN $_PODMAN_TEST_OPTS "$@" 3>/dev/null
     # without "quotes", multiple lines are glommed together into one
     if [ -n "$output" ]; then
-        echo "$output"
+        echo "$(timestamp) $output"
+
+        # FIXME FIXME FIXME: instrumenting to track down #15488. Please
+        # remove once that's fixed. We include the args because, remember,
+        # bats only shows output on error; it's possible that the first
+        # instance of the metacopy warning happens in a test that doesn't
+        # check output, hence doesn't fail.
+        if [[ "$output" =~ Ignoring.global.metacopy.option ]]; then
+            echo "# YO! metacopy warning triggered by: podman $*" >&3
+        fi
     fi
     if [ "$status" -ne 0 ]; then
-        echo -n "[ rc=$status ";
+        echo -n "$(timestamp) [ rc=$status ";
         if [ -n "$expected_rc" ]; then
             if [ "$status" -eq "$expected_rc" ]; then
                 echo -n "(expected) ";
@@ -219,12 +423,36 @@ function run_podman() {
             die "exit code is $status; expected $expected_rc"
         fi
     fi
+
+    # Check for "level=<unexpected>" in output, because a successful command
+    # should never issue unwanted warnings or errors. The "0+w" convention
+    # (see top of function) allows our caller to indicate that warnings are
+    # expected, e.g., "podman stop" without -t0.
+    if [[ $status -eq 0 ]]; then
+        # FIXME: don't do this on Debian or RHEL. runc is way too buggy:
+        #   - #11784 - lstat /sys/fs/.../*.scope: ENOENT
+        #   - #11785 - cannot toggle freezer: cgroups not configured
+        # As of January 2024 the freezer one seems to be fixed in Debian-runc
+        # but not in RHEL8-runc. The lstat one is closed-wontfix.
+        if [[ $PODMAN_RUNTIME != "runc" ]]; then
+            # FIXME: All kube commands emit unpredictable errors:
+            #    "Storage for container <X> has been removed"
+            #    "no container with ID <X> found in database"
+            # These are level=error but we still get exit-status 0.
+            # Just skip all kube commands completely
+            if [[ ! "$*" =~ kube ]]; then
+                if [[ "$output" =~ level=[^${allowed_levels}] ]]; then
+                    die "Command succeeded, but issued unexpected warnings"
+                fi
+            fi
+        fi
+    fi
 }
 
 
 # Wait for certain output from a container, indicating that it's ready.
 function wait_for_output {
-    local sleep_delay=5
+    local sleep_delay=1
     local how_long=$PODMAN_TIMEOUT
     local expect=
     local cid=
@@ -251,7 +479,7 @@ function wait_for_output {
 
     t1=$(expr $SECONDS + $how_long)
     while [ $SECONDS -lt $t1 ]; do
-        run_podman logs $cid
+        run_podman 0+w logs $cid
         logs=$output
         if expr "$logs" : ".*$expect" >/dev/null; then
             return
@@ -262,6 +490,13 @@ function wait_for_output {
         if [ $output != "true" ]; then
             run_podman inspect --format '{{.State.ExitCode}}' $cid
             exitcode=$output
+
+            # One last chance: maybe the container exited just after logs cmd
+            run_podman 0+w logs $cid
+            if expr "$logs" : ".*$expect" >/dev/null; then
+                return
+            fi
+
             die "Container exited (status: $exitcode) before we saw '$expect': $logs"
         fi
 
@@ -276,39 +511,47 @@ function wait_for_ready {
     wait_for_output 'READY' "$@"
 }
 
-######################
-#  random_free_port  #  Pick an available port within a specified range
-######################
-function random_free_port() {
-    local range=${1:-5000-5999}
-
-    local port
-    for port in $(shuf -i ${range}); do
-        if ! { exec {unused_fd}<> /dev/tcp/127.0.0.1/$port; } &>/dev/null; then
-            echo $port
-            return
-        fi
-    done
-
-    die "Could not find open port in range $range"
-}
-
 ###################
-#  wait_for_port  #  Returns once port is available on host
+#  wait_for_file  #  Returns once file is available on host
 ###################
-function wait_for_port() {
-    local host=$1                      # Probably "localhost"
-    local port=$2                      # Numeric port
-    local _timeout=${3:-5}              # Optional; default to 5 seconds
+function wait_for_file() {
+    local file=$1                       # The path to the file
+    local _timeout=${2:-5}              # Optional; default 5 seconds
 
     # Wait
     while [ $_timeout -gt 0 ]; do
-        { exec {unused_fd}<> /dev/tcp/$host/$port; } &>/dev/null && return
+        test -e $file && return
         sleep 1
         _timeout=$(( $_timeout - 1 ))
     done
 
-    die "Timed out waiting for $host:$port"
+    die "Timed out waiting for $file"
+}
+
+###########################
+#  wait_for_file_content  #  Like wait_for_output, but with files (not ctrs)
+###########################
+function wait_for_file_content() {
+    local file=$1                       # The path to the file
+    local content=$2                    # What to expect in the file
+    local _timeout=${3:-5}              # Optional; default 5 seconds
+
+    while :; do
+        grep -q "$content" "$file" && return
+
+        test $_timeout -gt 0 || die "Timed out waiting for '$content' in $file"
+
+        _timeout=$(( $_timeout - 1 ))
+        sleep 1
+
+        # For debugging. Note that file does not necessarily exist yet.
+        if [[ -e "$file" ]]; then
+            echo "[ wait_for_file_content: retrying wait for '$content' in: ]"
+            sed -e 's/^/[ /' -e 's/$/ ]/' <"$file"
+        else
+            echo "[ wait_for_file_content: $file does not exist (yet) ]"
+        fi
+    done
 }
 
 # END   podman helpers
@@ -316,10 +559,6 @@ function wait_for_port() {
 # BEGIN miscellaneous tools
 
 # Shortcuts for common needs:
-function is_ubuntu() {
-    grep -qiw ubuntu /etc/os-release
-}
-
 function is_rootless() {
     [ "$(id -u)" -ne 0 ]
 }
@@ -348,14 +587,47 @@ function is_netavark() {
     return 1
 }
 
+function is_aarch64() {
+    [ "$(uname -m)" == "aarch64" ]
+}
+
+function selinux_enabled() {
+    /usr/sbin/selinuxenabled 2> /dev/null
+}
+
 # Returns the OCI runtime *basename* (typically crun or runc). Much as we'd
 # love to cache this result, we probably shouldn't.
 function podman_runtime() {
     # This function is intended to be used as '$(podman_runtime)', i.e.
-    # our caller wants our output. run_podman() messes with output because
-    # it emits the command invocation to stdout, hence the redirection.
-    run_podman info --format '{{ .Host.OCIRuntime.Name }}' >/dev/null
-    basename "${output:-[null]}"
+    # our caller wants our output. It's unsafe to use run_podman().
+    runtime=$($PODMAN $_PODMAN_TEST_OPTS info --format '{{ .Host.OCIRuntime.Name }}' 2>/dev/null)
+    basename "${runtime:-[null]}"
+}
+
+# Returns the storage driver: 'overlay' or 'vfs'
+function podman_storage_driver() {
+    run_podman info --format '{{.Store.GraphDriverName}}' >/dev/null
+    # Should there ever be a new driver
+    case "$output" in
+        overlay) ;;
+        vfs)     ;;
+        *)       die "Unknown storage driver '$output'; if this is a new driver, please review uses of this function in tests." ;;
+    esac
+    echo "$output"
+}
+
+# Given a (scratch) directory path, returns a set of command-line options
+# for running an isolated podman that will not step on system podman. Set:
+#  - rootdir, so we don't clobber real images or storage;
+#  - tmpdir, so we use an isolated DB; and
+#  - runroot, out of an abundance of paranoia
+function podman_isolation_opts() {
+    local path=${1?podman_isolation_opts: missing PATH arg}
+
+    for opt in root runroot tmpdir;do
+        mkdir -p $path/$opt
+        echo " --$opt $path/$opt"
+    done
 }
 
 # rhbz#1895105: rootless journald is unavailable except to users in
@@ -435,6 +707,16 @@ function _add_label_if_missing() {
 }
 
 ######################
+#  skip_if_no_ssh #  ...with an optional message
+######################
+function skip_if_no_ssh() {
+    if no_ssh; then
+        local msg=$(_add_label_if_missing "$1" "ssh")
+        skip "${msg:-not applicable with no ssh binary}"
+    fi
+}
+
+######################
 #  skip_if_rootless  #  ...with an optional message
 ######################
 function skip_if_rootless() {
@@ -484,6 +766,15 @@ function skip_if_cgroupsv1() {
     fi
 }
 
+#######################
+#  skip_if_cgroupsv2  #  ...with an optional message
+#######################
+function skip_if_cgroupsv2() {
+    if is_cgroupsv2; then
+        skip "${1:-test requires cgroupsv1}"
+    fi
+}
+
 ######################
 #  skip_if_rootless_cgroupsv1  #  ...with an optional message
 ######################
@@ -505,13 +796,9 @@ function skip_if_journald_unavailable {
     fi
 }
 
-function skip_if_root_ubuntu {
-    if is_ubuntu; then
-        if ! is_remote; then
-            if ! is_rootless; then
-                 skip "Cannot run this test on rootful ubuntu, usually due to user errors"
-            fi
-        fi
+function skip_if_aarch64 {
+    if is_aarch64; then
+        skip "${msg:-Cannot run this test on aarch64 systems}"
     fi
 }
 
@@ -523,7 +810,7 @@ function die() {
     echo "#/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"  >&2
     echo "#| FAIL: $*"                                           >&2
     echo "#\\^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^" >&2
-    false
+    bail-now
 }
 
 ############
@@ -609,19 +896,37 @@ function assert() {
     fi
 
     # This is a multi-line message, which may in turn contain multi-line
-    # output, so let's format it ourself, readably
+    # output, so let's format it ourself to make it more readable.
+    local expect_split
+    mapfile -t expect_split <<<"$expect_string"
     local actual_split
-    IFS=$'\n' read -rd '' -a actual_split <<<"$actual_string" || true
+    mapfile -t actual_split <<<"$actual_string"
+
+    # bash %q is really nice, except for the way it backslashes spaces
+    local -a expect_split_q
+    for line in "${expect_split[@]}"; do
+        local q=$(printf "%q" "$line" | sed -e 's/\\ / /g')
+        expect_split_q+=("$q")
+    done
+    local -a actual_split_q
+    for line in "${actual_split[@]}"; do
+        local q=$(printf "%q" "$line" | sed -e 's/\\ / /g')
+        actual_split_q+=("$q")
+    done
+
     printf "#/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\n"    >&2
     printf "#|     FAIL: %s\n" "$testname"                        >&2
-    printf "#| expected: %s'%s'\n" "$op" "$expect_string"         >&2
-    printf "#|   actual: %s'%s'\n" "$ws" "${actual_split[0]}"     >&2
+    printf "#| expected: %s%s\n" "$op" "${expect_split_q[0]}"     >&2
     local line
-    for line in "${actual_split[@]:1}"; do
-        printf "#|         > %s'%s'\n" "$ws" "$line"              >&2
+    for line in "${expect_split_q[@]:1}"; do
+        printf "#|         > %s%s\n" "$ws" "$line"                >&2
+    done
+    printf "#|   actual: %s%s\n" "$ws" "${actual_split_q[0]}"     >&2
+    for line in "${actual_split_q[@]:1}"; do
+        printf "#|         > %s%s\n" "$ws" "$line"                >&2
     done
     printf "#\\^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"   >&2
-    false
+    bail-now
 }
 
 ########
@@ -659,7 +964,7 @@ function is() {
     fi
 
     # This is a multi-line message, which may in turn contain multi-line
-    # output, so let's format it ourself, readably
+    # output, so let's format it ourself to make it more readable.
     local -a actual_split
     readarray -t actual_split <<<"$actual"
     printf "#/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\n" >&2
@@ -671,9 +976,41 @@ function is() {
         printf "#|         > '%s'\n" "$line"                   >&2
     done
     printf "#\\^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n" >&2
-    false
+    bail-now
 }
 
+####################
+#  allow_warnings  #  check cmd output for warning messages other than these
+####################
+#
+# HEADS UP: Operates on '$lines' array, so, must be invoked after run_podman
+#
+function allow_warnings() {
+    for line in "${lines[@]}"; do
+        if [[ "$line" =~ level=[we] ]]; then
+            local ok=
+            for pattern in "$@"; do
+                if [[ "$line" =~ $pattern ]]; then
+                   ok=ok
+                fi
+            done
+            if [[ -z "$ok" ]]; then
+                die "Unexpected warning/error in command results: $line"
+            fi
+        fi
+    done
+}
+
+#####################
+#  require_warning  #  Require the given message, but disallow any others
+#####################
+# Optional 2nd argument is a message to display if warning is missing
+function require_warning() {
+    local expect="$1"
+    local msg="${2:-Did not find expected warning/error message}"
+    assert "$output" =~ "$expect" "$msg"
+    allow_warnings "$expect"
+}
 
 ############
 #  dprint  #  conditional debug message
@@ -745,36 +1082,6 @@ function random_string() {
     head /dev/urandom | tr -dc a-zA-Z0-9 | head -c$length
 }
 
-
-###########################
-#  random_rfc1918_subnet  #
-###########################
-#
-# Use the class B set, because much of our CI environment (Google, RH)
-# already uses up much of the class A, and it's really hard to test
-# if a block is in use.
-#
-# This returns THREE OCTETS! It is up to our caller to append .0/24, .255, &c.
-#
-function random_rfc1918_subnet() {
-    local retries=1024
-
-    while [ "$retries" -gt 0 ];do
-        local cidr=172.$(( 16 + $RANDOM % 16 )).$(( $RANDOM & 255 ))
-
-        in_use=$(ip route list | fgrep $cidr)
-        if [ -z "$in_use" ]; then
-            echo "$cidr"
-            return
-        fi
-
-        retries=$(( retries - 1 ))
-    done
-
-    die "Could not find a random not-in-use rfc1918 subnet"
-}
-
-
 #########################
 #  find_exec_pid_files  #  Returns nothing or exec_pid hash files
 #########################
@@ -833,6 +1140,42 @@ function _podman_commands() {
     # &>/dev/null prevents duplicate output
     run_podman help "$@" &>/dev/null
     awk '/^Available Commands:/{ok=1;next}/^Options:/{ok=0}ok { print $1 }' <<<"$output" | grep .
+}
+
+##########################
+#  sleep_to_next_second  #  Sleep until second rolls over
+##########################
+
+function sleep_to_next_second() {
+    sleep 0.$(printf '%04d' $((10000 - 10#$(date +%4N))))
+}
+
+function wait_for_command_output() {
+    local cmd="$1"
+    local want="$2"
+    local tries=20
+    local sleep_delay=0.5
+
+    case "${#*}" in
+        2) ;;
+        4) tries="$3"
+           sleep_delay="$4"
+           ;;
+        *) die "Internal error: 'wait_for_command_output' requires two or four arguments" ;;
+    esac
+
+    while [[ $tries -gt 0 ]]; do
+        echo "$_LOG_PROMPT $cmd"
+        run $cmd
+        echo "$output"
+        if [[ "$output" = "$want" ]]; then
+            return
+        fi
+
+        sleep $sleep_delay
+        tries=$((tries - 1))
+    done
+    die "Timed out waiting for '$cmd' to return '$want'"
 }
 
 # END   miscellaneous tools

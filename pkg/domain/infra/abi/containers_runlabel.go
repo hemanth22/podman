@@ -2,19 +2,21 @@ package abi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/containers/common/libimage"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	envLib "github.com/containers/podman/v4/pkg/env"
-	"github.com/containers/podman/v4/utils"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	envLib "github.com/containers/podman/v5/pkg/env"
+	"github.com/containers/podman/v5/utils"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/google/shlex"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -40,7 +42,7 @@ func (ic *ContainerEngine) ContainerRunlabel(ctx context.Context, label string, 
 	}
 
 	if len(pulledImages) != 1 {
-		return errors.Errorf("internal error: expected an image to be pulled (or an error)")
+		return errors.New("internal error: expected an image to be pulled (or an error)")
 	}
 
 	// Extract the runlabel from the image.
@@ -57,7 +59,7 @@ func (ic *ContainerEngine) ContainerRunlabel(ctx context.Context, label string, 
 		}
 	}
 	if runlabel == "" {
-		return errors.Errorf("cannot find the value of label: %s in image: %s", label, imageRef)
+		return fmt.Errorf("cannot find the value of label: %s in image: %s", label, imageRef)
 	}
 
 	cmd, env, err := generateRunlabelCommand(runlabel, pulledImages[0], imageRef, args, options)
@@ -86,7 +88,7 @@ func (ic *ContainerEngine) ContainerRunlabel(ctx context.Context, label string, 
 				name := cmd[i+1]
 				ctr, err := ic.Libpod.LookupContainer(name)
 				if err != nil {
-					if errors.Cause(err) != define.ErrNoSuchCtr {
+					if !errors.Is(err, define.ErrNoSuchCtr) {
 						logrus.Debugf("Error occurred searching for container %s: %v", name, err)
 						return err
 					}
@@ -135,7 +137,7 @@ func generateRunlabelCommand(runlabel string, img *libimage.Image, inputName str
 		name = splitImageName[len(splitImageName)-1]
 		// make sure to remove the tag from the image name, otherwise the name cannot
 		// be used as container name because a colon is an illegal character
-		name = strings.SplitN(name, ":", 2)[0]
+		name, _, _ = strings.Cut(name, ":")
 	}
 
 	// Append the user-specified arguments to the runlabel (command).
@@ -171,6 +173,13 @@ func generateRunlabelCommand(runlabel string, img *libimage.Image, inputName str
 				return ""
 			}
 			return d
+		case "HOME":
+			h, err := os.UserHomeDir()
+			if err != nil {
+				logrus.Warnf("Unable to determine user's home directory: %s", err)
+				return ""
+			}
+			return h
 		}
 		return ""
 	}
@@ -276,7 +285,7 @@ func substituteCommand(cmd string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if _, err := os.Stat(res); !os.IsNotExist(err) {
+		if err := fileutils.Exists(res); !errors.Is(err, fs.ErrNotExist) {
 			return res, nil
 		} else if err != nil {
 			return "", err

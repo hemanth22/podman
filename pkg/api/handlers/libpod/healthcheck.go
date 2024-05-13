@@ -3,16 +3,16 @@ package libpod
 import (
 	"net/http"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
 )
 
 func RunHealthCheck(w http.ResponseWriter, r *http.Request) {
 	runtime := r.Context().Value(api.RuntimeKey).(*libpod.Runtime)
 	name := utils.GetName(r)
-	status, err := runtime.HealthCheck(name)
+	status, err := runtime.HealthCheck(r.Context(), name)
 	if err != nil {
 		if status == define.HealthCheckContainerNotFound {
 			utils.ContainerNotFound(w, name, err)
@@ -32,6 +32,8 @@ func RunHealthCheck(w http.ResponseWriter, r *http.Request) {
 	hcStatus := define.HealthCheckUnhealthy
 	if status == define.HealthCheckSuccess {
 		hcStatus = define.HealthCheckHealthy
+	} else if status == define.HealthCheckStartup {
+		hcStatus = define.HealthCheckStarting
 	}
 	report := define.HealthCheckResults{
 		Status: hcStatus,

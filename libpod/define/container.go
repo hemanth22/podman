@@ -1,5 +1,9 @@
 package define
 
+import (
+	"fmt"
+)
+
 // Valid restart policy types.
 const (
 	// RestartPolicyNone indicates that no restart policy has been requested
@@ -27,9 +31,19 @@ var RestartPolicyMap = map[string]string{
 	RestartPolicyUnlessStopped: RestartPolicyUnlessStopped,
 }
 
+// Validate that the given string is a valid restart policy.
+func ValidateRestartPolicy(policy string) error {
+	switch policy {
+	case RestartPolicyNone, RestartPolicyNo, RestartPolicyOnFailure, RestartPolicyAlways, RestartPolicyUnlessStopped:
+		return nil
+	default:
+		return fmt.Errorf("%q is not a valid restart policy: %w", policy, ErrInvalidArg)
+	}
+}
+
 // InitContainerTypes
 const (
-	// AlwaysInitContainer is an init container than runs on each
+	// AlwaysInitContainer is an init container that runs on each
 	// pod start (including restart)
 	AlwaysInitContainer = "always"
 	// OneShotInitContainer is a container that only runs as init once
@@ -37,4 +51,14 @@ const (
 	OneShotInitContainer = "once"
 	// ContainerInitPath is the default path of the mounted container init.
 	ContainerInitPath = "/run/podman-init"
+)
+
+// Kubernetes Kinds
+const (
+	// A Pod kube yaml spec
+	K8sKindPod = "pod"
+	// A Deployment kube yaml spec
+	K8sKindDeployment = "deployment"
+	// A DaemonSet kube yaml spec
+	K8sKindDaemonSet = "daemonset"
 )

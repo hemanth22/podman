@@ -1,15 +1,16 @@
-//nolint:deadcode,unused // these types are used to wire generated swagger to API code
+//nolint:unused // these types are used to wire generated swagger to API code
 package swagger
 
 import (
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/image/v5/manifest"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/api/handlers"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/entities/reports"
-	"github.com/containers/podman/v4/pkg/inspect"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/inspect"
 	dockerAPI "github.com/docker/docker/api/types"
+	dockerImage "github.com/docker/docker/api/types/image"
 	dockerVolume "github.com/docker/docker/api/types/volume"
 )
 
@@ -39,6 +40,13 @@ type imageInspect struct {
 type imagesLoadResponseLibpod struct {
 	// in:body
 	Body entities.ImageLoadReport
+}
+
+// Image Scp
+// swagger:response
+type imagesScpResponseLibpod struct {
+	// in:body
+	Body reports.ScpReport
 }
 
 // Image Import
@@ -212,7 +220,7 @@ type execSessionInspect struct {
 // swagger:response
 type imageList struct {
 	// in:body
-	Body []dockerAPI.ImageSummary
+	Body []dockerImage.Summary
 }
 
 // Image summary for libpod API
@@ -233,7 +241,7 @@ type containersList struct {
 // swagger:response
 type volumeInspect struct {
 	// in:body
-	Body dockerAPI.Volume
+	Body dockerVolume.Volume
 }
 
 // Volume prune
@@ -247,7 +255,7 @@ type volumePruneResponse struct {
 // swagger:response
 type volumeList struct {
 	// in:body
-	Body dockerVolume.VolumeListOKBody
+	Body dockerVolume.ListResponse
 }
 
 // Volume list
@@ -304,6 +312,11 @@ type volumePruneLibpod struct {
 type containerCreateResponse struct {
 	// in:body
 	Body entities.ContainerCreateResponse
+}
+
+type containerUpdateResponse struct {
+	// in:body
+	ID string
 }
 
 // Wait container
@@ -421,7 +434,7 @@ type networkRmResponse struct {
 // swagger:response
 type networkInspectResponse struct {
 	// in:body
-	Body types.Network
+	Body entities.NetworkInspectReport
 }
 
 // Network list

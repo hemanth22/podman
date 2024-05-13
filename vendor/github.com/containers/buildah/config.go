@@ -3,23 +3,23 @@ package buildah
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/platforms"
 	"github.com/containers/buildah/define"
 	"github.com/containers/buildah/docker"
-	"github.com/containers/common/pkg/util"
+	internalUtil "github.com/containers/buildah/internal/util"
 	"github.com/containers/image/v5/manifest"
 	"github.com/containers/image/v5/pkg/compression"
 	"github.com/containers/image/v5/transports"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/storage/pkg/stringid"
 	ociv1 "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/slices"
 )
 
 // unmarshalConvertedConfig obtains the config blob of img valid for the wantedManifestMIMEType format
@@ -28,7 +28,7 @@ import (
 func unmarshalConvertedConfig(ctx context.Context, dest interface{}, img types.Image, wantedManifestMIMEType string) error {
 	_, actualManifestMIMEType, err := img.Manifest(ctx)
 	if err != nil {
-		return errors.Wrapf(err, "error getting manifest MIME type for %q", transports.ImageName(img.Reference()))
+		return fmt.Errorf("getting manifest MIME type for %q: %w", transports.ImageName(img.Reference()), err)
 	}
 	if wantedManifestMIMEType != actualManifestMIMEType {
 		layerInfos := img.LayerInfos()
@@ -40,22 +40,22 @@ func unmarshalConvertedConfig(ctx context.Context, dest interface{}, img types.I
 			LayerInfos: layerInfos,
 		})
 		if err != nil {
-			return errors.Wrapf(err, "resetting recorded compression for %q", transports.ImageName(img.Reference()))
+			return fmt.Errorf("resetting recorded compression for %q: %w", transports.ImageName(img.Reference()), err)
 		}
 		secondUpdatedImg, err := updatedImg.UpdatedImage(ctx, types.ManifestUpdateOptions{
 			ManifestMIMEType: wantedManifestMIMEType,
 		})
 		if err != nil {
-			return errors.Wrapf(err, "error converting image %q from %q to %q", transports.ImageName(img.Reference()), actualManifestMIMEType, wantedManifestMIMEType)
+			return fmt.Errorf("converting image %q from %q to %q: %w", transports.ImageName(img.Reference()), actualManifestMIMEType, wantedManifestMIMEType, err)
 		}
 		img = secondUpdatedImg
 	}
 	config, err := img.ConfigBlob(ctx)
 	if err != nil {
-		return errors.Wrapf(err, "error reading %s config from %q", wantedManifestMIMEType, transports.ImageName(img.Reference()))
+		return fmt.Errorf("reading %s config from %q: %w", wantedManifestMIMEType, transports.ImageName(img.Reference()), err)
 	}
 	if err := json.Unmarshal(config, dest); err != nil {
-		return errors.Wrapf(err, "error parsing %s configuration %q from %q", wantedManifestMIMEType, string(config), transports.ImageName(img.Reference()))
+		return fmt.Errorf("parsing %s configuration %q from %q: %w", wantedManifestMIMEType, string(config), transports.ImageName(img.Reference()), err)
 	}
 	return nil
 }
@@ -64,11 +64,11 @@ func (b *Builder) initConfig(ctx context.Context, img types.Image, sys *types.Sy
 	if img != nil { // A pre-existing image, as opposed to a "FROM scratch" new one.
 		rawManifest, manifestMIMEType, err := img.Manifest(ctx)
 		if err != nil {
-			return errors.Wrapf(err, "error reading image manifest for %q", transports.ImageName(img.Reference()))
+			return fmt.Errorf("reading image manifest for %q: %w", transports.ImageName(img.Reference()), err)
 		}
 		rawConfig, err := img.ConfigBlob(ctx)
 		if err != nil {
-			return errors.Wrapf(err, "error reading image configuration for %q", transports.ImageName(img.Reference()))
+			return fmt.Errorf("reading image configuration for %q: %w", transports.ImageName(img.Reference()), err)
 		}
 		b.Manifest = rawManifest
 		b.Config = rawConfig
@@ -89,16 +89,10 @@ func (b *Builder) initConfig(ctx context.Context, img types.Image, sys *types.Sy
 			// Attempt to recover format-specific data from the manifest.
 			v1Manifest := ociv1.Manifest{}
 			if err := json.Unmarshal(b.Manifest, &v1Manifest); err != nil {
-				return errors.Wrapf(err, "error parsing OCI manifest %q", string(b.Manifest))
+				return fmt.Errorf("parsing OCI manifest %q: %w", string(b.Manifest), err)
 			}
 			for k, v := range v1Manifest.Annotations {
-				// NOTE: do not override annotations that are
-				// already set. Otherwise, we may erase
-				// annotations such as the digest of the base
-				// image.
-				if value := b.ImageAnnotations[k]; value == "" {
-					b.ImageAnnotations[k] = v
-				}
+				b.ImageAnnotations[k] = v
 			}
 		}
 	}
@@ -136,7 +130,16 @@ func (b *Builder) fixupConfig(sys *types.SystemContext) {
 			b.SetArchitecture(runtime.GOARCH)
 		}
 		// in case the arch string we started with was shorthand for a known arch+variant pair, normalize it
-		ps := platforms.Normalize(ociv1.Platform{OS: b.OS(), Architecture: b.Architecture(), Variant: b.Variant()})
+		ps := internalUtil.NormalizePlatform(ociv1.Platform{OS: b.OS(), Architecture: b.Architecture(), Variant: b.Variant()})
+		b.SetArchitecture(ps.Architecture)
+		b.SetVariant(ps.Variant)
+	}
+	if b.Variant() == "" {
+		if sys != nil && sys.VariantChoice != "" {
+			b.SetVariant(sys.VariantChoice)
+		}
+		// in case the arch string we started with was shorthand for a known arch+variant pair, normalize it
+		ps := internalUtil.NormalizePlatform(ociv1.Platform{OS: b.OS(), Architecture: b.Architecture(), Variant: b.Variant()})
 		b.SetArchitecture(ps.Architecture)
 		b.SetVariant(ps.Variant)
 	}
@@ -226,10 +229,10 @@ func (b *Builder) OSFeatures() []string {
 // SetOSFeature adds a feature of the OS which the container, or a container
 // built using an image built from this container, depends on the OS supplying.
 func (b *Builder) SetOSFeature(feature string) {
-	if !util.StringInSlice(feature, b.OCIv1.OSFeatures) {
+	if !slices.Contains(b.OCIv1.OSFeatures, feature) {
 		b.OCIv1.OSFeatures = append(b.OCIv1.OSFeatures, feature)
 	}
-	if !util.StringInSlice(feature, b.Docker.OSFeatures) {
+	if !slices.Contains(b.Docker.OSFeatures, feature) {
 		b.Docker.OSFeatures = append(b.Docker.OSFeatures, feature)
 	}
 }
@@ -238,7 +241,7 @@ func (b *Builder) SetOSFeature(feature string) {
 // container built using an image built from this container, depends on the OS
 // supplying.
 func (b *Builder) UnsetOSFeature(feature string) {
-	if util.StringInSlice(feature, b.OCIv1.OSFeatures) {
+	if slices.Contains(b.OCIv1.OSFeatures, feature) {
 		features := make([]string, 0, len(b.OCIv1.OSFeatures))
 		for _, f := range b.OCIv1.OSFeatures {
 			if f != feature {
@@ -247,7 +250,7 @@ func (b *Builder) UnsetOSFeature(feature string) {
 		}
 		b.OCIv1.OSFeatures = features
 	}
-	if util.StringInSlice(feature, b.Docker.OSFeatures) {
+	if slices.Contains(b.Docker.OSFeatures, feature) {
 		features := make([]string, 0, len(b.Docker.OSFeatures))
 		for _, f := range b.Docker.OSFeatures {
 			if f != feature {

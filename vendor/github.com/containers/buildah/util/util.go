@@ -1,6 +1,7 @@
 package util
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -8,13 +9,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/containers/buildah/define"
 	"github.com/containers/common/libimage"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/common/pkg/util"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/pkg/shortnames"
 	"github.com/containers/image/v5/signature"
@@ -24,8 +23,8 @@ import (
 	"github.com/docker/distribution/registry/api/errcode"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/slices"
 )
 
 const (
@@ -45,9 +44,9 @@ var (
 	}
 )
 
-// StringInSlice is deprecated, use github.com/containers/common/pkg/util.StringInSlice
+// StringInSlice is deprecated, use golang.org/x/exp/slices.Contains
 func StringInSlice(s string, slice []string) bool {
-	return util.StringInSlice(s, slice)
+	return slices.Contains(slice, s)
 }
 
 // resolveName checks if name is a valid image name, and if that name doesn't
@@ -118,18 +117,18 @@ func ExpandNames(names []string, systemContext *types.SystemContext, store stora
 		var name reference.Named
 		nameList, _, err := resolveName(n, systemContext, store)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error parsing name %q", n)
+			return nil, fmt.Errorf("parsing name %q: %w", n, err)
 		}
 		if len(nameList) == 0 {
 			named, err := reference.ParseNormalizedNamed(n)
 			if err != nil {
-				return nil, errors.Wrapf(err, "error parsing name %q", n)
+				return nil, fmt.Errorf("parsing name %q: %w", n, err)
 			}
 			name = named
 		} else {
 			named, err := reference.ParseNormalizedNamed(nameList[0])
 			if err != nil {
-				return nil, errors.Wrapf(err, "error parsing name %q", nameList[0])
+				return nil, fmt.Errorf("parsing name %q: %w", nameList[0], err)
 			}
 			name = named
 		}
@@ -169,7 +168,7 @@ func ResolveNameToReferences(
 ) (refs []types.ImageReference, err error) {
 	names, transport, err := resolveName(image, systemContext, store)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error parsing name %q", image)
+		return nil, fmt.Errorf("parsing name %q: %w", image, err)
 	}
 
 	if transport != DefaultTransport {
@@ -185,7 +184,7 @@ func ResolveNameToReferences(
 		refs = append(refs, ref)
 	}
 	if len(refs) == 0 {
-		return nil, errors.Errorf("error locating images with names %v", names)
+		return nil, fmt.Errorf("locating images with names %v", names)
 	}
 	return refs, nil
 }
@@ -206,7 +205,7 @@ func AddImageNames(store storage.Store, firstRegistry string, systemContext *typ
 
 	for _, tag := range addNames {
 		if err := localImage.Tag(tag); err != nil {
-			return errors.Wrapf(err, "error tagging image %s", image.ID)
+			return fmt.Errorf("tagging image %s: %w", image.ID, err)
 		}
 	}
 
@@ -217,7 +216,7 @@ func AddImageNames(store storage.Store, firstRegistry string, systemContext *typ
 // error message that reflects the reason of the failure.
 // In case err type is not a familiar one the error "defaultError" is returned.
 func GetFailureCause(err, defaultError error) error {
-	switch nErr := errors.Cause(err).(type) {
+	switch nErr := err.(type) {
 	case errcode.Errors:
 		return err
 	case errcode.Error, *url.Error:
@@ -244,7 +243,7 @@ func Runtime() string {
 
 	conf, err := config.Default()
 	if err != nil {
-		logrus.Warnf("Error loading container config when searching for local runtime: %v", err)
+		logrus.Warnf("Error loading default container config when searching for local runtime: %v", err)
 		return define.DefaultRuntime
 	}
 	return conf.Engine.OCIRuntime
@@ -263,7 +262,7 @@ func GetContainerIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (ui
 		}
 	}
 	if !uidMapped {
-		return 0, 0, errors.Errorf("container uses ID mappings (%#v), but doesn't map UID %d", uidmap, uid)
+		return 0, 0, fmt.Errorf("container uses ID mappings (%#v), but doesn't map UID %d", uidmap, uid)
 	}
 	gidMapped := true
 	for _, m := range gidmap {
@@ -275,7 +274,7 @@ func GetContainerIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (ui
 		}
 	}
 	if !gidMapped {
-		return 0, 0, errors.Errorf("container uses ID mappings (%#v), but doesn't map GID %d", gidmap, gid)
+		return 0, 0, fmt.Errorf("container uses ID mappings (%#v), but doesn't map GID %d", gidmap, gid)
 	}
 	return uid, gid, nil
 }
@@ -293,7 +292,7 @@ func GetHostIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (uint32,
 		}
 	}
 	if !uidMapped {
-		return 0, 0, errors.Errorf("container uses ID mappings (%#v), but doesn't map UID %d", uidmap, uid)
+		return 0, 0, fmt.Errorf("container uses ID mappings (%#v), but doesn't map UID %d", uidmap, uid)
 	}
 	gidMapped := true
 	for _, m := range gidmap {
@@ -305,7 +304,7 @@ func GetHostIDs(uidmap, gidmap []specs.LinuxIDMapping, uid, gid uint32) (uint32,
 		}
 	}
 	if !gidMapped {
-		return 0, 0, errors.Errorf("container uses ID mappings (%#v), but doesn't map GID %d", gidmap, gid)
+		return 0, 0, fmt.Errorf("container uses ID mappings (%#v), but doesn't map GID %d", gidmap, gid)
 	}
 	return uid, gid, nil
 }
@@ -376,21 +375,17 @@ func TruncateString(str string, to int) string {
 	return newStr
 }
 
-var (
-	isUnifiedOnce sync.Once
-	isUnified     bool
-	isUnifiedErr  error
-)
-
 // fileExistsAndNotADir - Check to see if a file exists
 // and that it is not a directory.
-func fileExistsAndNotADir(path string) bool {
+func fileExistsAndNotADir(path string) (bool, error) {
 	file, err := os.Stat(path)
-
-	if file == nil || err != nil || os.IsNotExist(err) {
-		return false
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
-	return !file.IsDir()
+	return !file.IsDir(), nil
 }
 
 // FindLocalRuntime find the local runtime of the
@@ -404,7 +399,11 @@ func FindLocalRuntime(runtime string) string {
 		return localRuntime
 	}
 	for _, val := range conf.Engine.OCIRuntimes[runtime] {
-		if fileExistsAndNotADir(val) {
+		exists, err := fileExistsAndNotADir(val)
+		if err != nil {
+			logrus.Errorf("Failed to determine if file exists and is not a directory: %v", err)
+		}
+		if exists {
 			localRuntime = val
 			break
 		}
@@ -435,7 +434,14 @@ func (m byDestination) Len() int {
 }
 
 func (m byDestination) Less(i, j int) bool {
-	return m.parts(i) < m.parts(j)
+	iparts, jparts := m.parts(i), m.parts(j)
+	switch {
+	case iparts < jparts:
+		return true
+	case iparts > jparts:
+		return false
+	}
+	return filepath.Clean(m[i].Destination) < filepath.Clean(m[j].Destination)
 }
 
 func (m byDestination) Swap(i, j int) {
@@ -447,7 +453,7 @@ func (m byDestination) parts(i int) int {
 }
 
 func SortMounts(m []specs.Mount) []specs.Mount {
-	sort.Sort(byDestination(m))
+	sort.Stable(byDestination(m))
 	return m
 }
 

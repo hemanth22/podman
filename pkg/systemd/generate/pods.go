@@ -1,7 +1,10 @@
+//go:build !remote
+
 package generate
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -9,11 +12,10 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/systemd/define"
-	"github.com/containers/podman/v4/version"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/systemd/define"
+	"github.com/containers/podman/v5/version"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 )
@@ -61,10 +63,8 @@ type podInfo struct {
 	PodCreateCommand string
 	// EnvVariable is generate.EnvVariable and must not be set.
 	EnvVariable string
-	// ExecStartPre1 of the unit.
-	ExecStartPre1 string
-	// ExecStartPre2 of the unit.
-	ExecStartPre2 string
+	// ExecStartPre of the unit.
+	ExecStartPre string
 	// ExecStart of the unit.
 	ExecStart string
 	// TimeoutStopSec of the unit.
@@ -92,7 +92,7 @@ type podInfo struct {
 	Requires []string
 }
 
-const podTemplate = headerTemplate + `Requires={{{{- range $index, $value := .RequiredServices -}}}}{{{{if $index}}}} {{{{end}}}}{{{{ $value }}}}.service{{{{end}}}}
+const podTemplate = headerTemplate + `Wants={{{{- range $index, $value := .RequiredServices -}}}}{{{{if $index}}}} {{{{end}}}}{{{{ $value }}}}.service{{{{end}}}}
 Before={{{{- range $index, $value := .RequiredServices -}}}}{{{{if $index}}}} {{{{end}}}}{{{{ $value }}}}.service{{{{end}}}}
 {{{{- if or .Wants .After .Requires }}}}
 
@@ -115,11 +115,8 @@ Restart={{{{.RestartPolicy}}}}
 RestartSec={{{{.RestartSec}}}}
 {{{{- end}}}}
 TimeoutStopSec={{{{.TimeoutStopSec}}}}
-{{{{- if .ExecStartPre1}}}}
-ExecStartPre={{{{.ExecStartPre1}}}}
-{{{{- end}}}}
-{{{{- if .ExecStartPre2}}}}
-ExecStartPre={{{{.ExecStartPre2}}}}
+{{{{- if .ExecStartPre}}}}
+ExecStartPre={{{{.ExecStartPre}}}}
 {{{{- end}}}}
 ExecStart={{{{.ExecStart}}}}
 ExecStop={{{{.ExecStop}}}}
@@ -141,7 +138,7 @@ func PodUnits(pod *libpod.Pod, options entities.GenerateSystemdOptions) (map[str
 	// Error out if the pod has no infra container, which we require to be the
 	// main service.
 	if !pod.HasInfraContainer() {
-		return nil, errors.Errorf("generating systemd unit files: Pod %q has no infra container", pod.Name())
+		return nil, fmt.Errorf("generating systemd unit files: Pod %q has no infra container", pod.Name())
 	}
 
 	podInfo, err := generatePodInfo(pod, options)
@@ -160,7 +157,7 @@ func PodUnits(pod *libpod.Pod, options entities.GenerateSystemdOptions) (map[str
 		return nil, err
 	}
 	if len(containers) == 0 {
-		return nil, errors.Errorf("generating systemd unit files: Pod %q has no containers", pod.Name())
+		return nil, fmt.Errorf("generating systemd unit files: Pod %q has no containers", pod.Name())
 	}
 	graph, err := libpod.BuildContainerGraph(containers)
 	if err != nil {
@@ -175,6 +172,7 @@ func PodUnits(pod *libpod.Pod, options entities.GenerateSystemdOptions) (map[str
 		if ctr.ID() == infraID {
 			continue
 		}
+
 		ctrInfo, err := generateContainerInfo(ctr, options)
 		if err != nil {
 			return nil, err
@@ -217,7 +215,7 @@ func generatePodInfo(pod *libpod.Pod, options entities.GenerateSystemdOptions) (
 	// containerInfo acts as the main service of the pod.
 	infraCtr, err := pod.InfraContainer()
 	if err != nil {
-		return nil, errors.Wrap(err, "could not find infra container")
+		return nil, fmt.Errorf("could not find infra container: %w", err)
 	}
 
 	stopTimeout := infraCtr.StopTimeout()
@@ -228,12 +226,12 @@ func generatePodInfo(pod *libpod.Pod, options entities.GenerateSystemdOptions) (
 	config := infraCtr.Config()
 	conmonPidFile := config.ConmonPidFile
 	if conmonPidFile == "" {
-		return nil, errors.Errorf("conmon PID file path is empty, try to recreate the container with --conmon-pidfile flag")
+		return nil, errors.New("conmon PID file path is empty, try to recreate the container with --conmon-pidfile flag")
 	}
 
 	createCommand := pod.CreateCommand()
 	if options.New && len(createCommand) == 0 {
-		return nil, errors.Errorf("cannot use --new on pod %q: no create command found", pod.ID())
+		return nil, fmt.Errorf("cannot use --new on pod %q: no create command found", pod.ID())
 	}
 
 	nameOrID := pod.ID()
@@ -252,18 +250,19 @@ func generatePodInfo(pod *libpod.Pod, options entities.GenerateSystemdOptions) (
 		StopTimeout:       stopTimeout,
 		GenerateTimestamp: true,
 		CreateCommand:     createCommand,
+		RunRoot:           infraCtr.Runtime().RunRoot(),
 	}
 	return &info, nil
 }
 
-// Unless already specified, the pod's exit policy to "stop".
-func setPodExitPolicy(cmd []string) []string {
+// Determine whether the command array includes an exit-policy setting
+func hasPodExitPolicy(cmd []string) bool {
 	for _, arg := range cmd {
 		if strings.HasPrefix(arg, "--exit-policy=") || arg == "--exit-policy" {
-			return cmd
+			return true
 		}
 	}
-	return append(cmd, "--exit-policy=stop")
+	return false
 }
 
 // executePodTemplate executes the pod template on the specified podInfo.  Note
@@ -293,9 +292,9 @@ func executePodTemplate(info *podInfo, options entities.GenerateSystemdOptions) 
 	}
 
 	info.EnvVariable = define.EnvVariable
-	info.ExecStart = "{{{{.Executable}}}} start {{{{.InfraNameOrID}}}}"
-	info.ExecStop = "{{{{.Executable}}}} stop {{{{if (ge .StopTimeout 0)}}}}-t {{{{.StopTimeout}}}}{{{{end}}}} {{{{.InfraNameOrID}}}}"
-	info.ExecStopPost = "{{{{.Executable}}}} stop {{{{if (ge .StopTimeout 0)}}}}-t {{{{.StopTimeout}}}}{{{{end}}}} {{{{.InfraNameOrID}}}}"
+	info.ExecStart = formatOptionsString("{{{{.Executable}}}} start {{{{.InfraNameOrID}}}}")
+	info.ExecStop = formatOptionsString("{{{{.Executable}}}} stop {{{{if (ge .StopTimeout 0)}}}} -t {{{{.StopTimeout}}}}{{{{end}}}} {{{{.InfraNameOrID}}}}")
+	info.ExecStopPost = formatOptionsString("{{{{.Executable}}}} stop {{{{if (ge .StopTimeout 0)}}}} -t {{{{.StopTimeout}}}}{{{{end}}}} {{{{.InfraNameOrID}}}}")
 
 	// Assemble the ExecStart command when creating a new pod.
 	//
@@ -312,7 +311,7 @@ func executePodTemplate(info *podInfo, options entities.GenerateSystemdOptions) 
 		var podRootArgs, podCreateArgs []string
 		switch len(info.CreateCommand) {
 		case 0, 1, 2:
-			return "", errors.Errorf("pod does not appear to be created via `podman pod create`: %v", info.CreateCommand)
+			return "", fmt.Errorf("pod does not appear to be created via `podman pod create`: %v", info.CreateCommand)
 		default:
 			// Make sure that pod was created with `pod create` and
 			// not something else, such as `run --pod new`.
@@ -323,7 +322,7 @@ func executePodTemplate(info *podInfo, options entities.GenerateSystemdOptions) 
 				}
 			}
 			if podCreateIndex == 0 {
-				return "", errors.Errorf("pod does not appear to be created via `podman pod create`: %v", info.CreateCommand)
+				return "", fmt.Errorf("pod does not appear to be created via `podman pod create`: %v", info.CreateCommand)
 			}
 			podRootArgs = info.CreateCommand[1 : podCreateIndex-1]
 			info.RootFlags = strings.Join(escapeSystemdArguments(podRootArgs), " ")
@@ -364,15 +363,16 @@ func executePodTemplate(info *podInfo, options entities.GenerateSystemdOptions) 
 			podCreateArgs = append(podCreateArgs, "--replace")
 		}
 
+		if !hasPodExitPolicy(append(startCommand, podCreateArgs...)) {
+			startCommand = append(startCommand, "--exit-policy=stop")
+		}
 		startCommand = append(startCommand, podCreateArgs...)
-		startCommand = setPodExitPolicy(startCommand)
 		startCommand = escapeSystemdArguments(startCommand)
 
-		info.ExecStartPre1 = "/bin/rm -f {{{{.PIDFile}}}} {{{{.PodIDFile}}}}"
-		info.ExecStartPre2 = strings.Join(startCommand, " ")
-		info.ExecStart = "{{{{.Executable}}}} {{{{if .RootFlags}}}}{{{{ .RootFlags}}}} {{{{end}}}}pod start --pod-id-file {{{{.PodIDFile}}}}"
-		info.ExecStop = "{{{{.Executable}}}} {{{{if .RootFlags}}}}{{{{ .RootFlags}}}} {{{{end}}}}pod stop --ignore --pod-id-file {{{{.PodIDFile}}}} {{{{if (ge .StopTimeout 0)}}}}-t {{{{.StopTimeout}}}}{{{{end}}}}"
-		info.ExecStopPost = "{{{{.Executable}}}} {{{{if .RootFlags}}}}{{{{ .RootFlags}}}} {{{{end}}}}pod rm --ignore -f --pod-id-file {{{{.PodIDFile}}}}"
+		info.ExecStartPre = formatOptions(startCommand)
+		info.ExecStart = formatOptionsString("{{{{.Executable}}}} {{{{if .RootFlags}}}}{{{{ .RootFlags}}}} {{{{end}}}}pod start --pod-id-file {{{{.PodIDFile}}}}")
+		info.ExecStop = formatOptionsString("{{{{.Executable}}}} {{{{if .RootFlags}}}}{{{{ .RootFlags}}}} {{{{end}}}}pod stop --ignore --pod-id-file {{{{.PodIDFile}}}} {{{{if (ge .StopTimeout 0)}}}} -t {{{{.StopTimeout}}}}{{{{end}}}}")
+		info.ExecStopPost = formatOptionsString("{{{{.Executable}}}} {{{{if .RootFlags}}}}{{{{ .RootFlags}}}} {{{{end}}}}pod rm --ignore -f --pod-id-file {{{{.PodIDFile}}}}")
 	}
 	info.TimeoutStopSec = minTimeoutStopSec + info.StopTimeout
 
@@ -386,7 +386,7 @@ func executePodTemplate(info *podInfo, options entities.GenerateSystemdOptions) 
 	}
 
 	if info.GenerateTimestamp {
-		info.TimeStamp = fmt.Sprintf("%v", time.Now().Format(time.UnixDate))
+		info.TimeStamp = time.Now().Format(time.UnixDate)
 	}
 
 	// Sort the slices to assure a deterministic output.
@@ -402,7 +402,7 @@ func executePodTemplate(info *podInfo, options entities.GenerateSystemdOptions) 
 	// template execution.
 	templ, err := template.New("pod_template").Delims("{{{{", "}}}}").Parse(podTemplate)
 	if err != nil {
-		return "", errors.Wrap(err, "error parsing systemd service template")
+		return "", fmt.Errorf("parsing systemd service template: %w", err)
 	}
 
 	var buf bytes.Buffer
@@ -413,7 +413,7 @@ func executePodTemplate(info *podInfo, options entities.GenerateSystemdOptions) 
 	// Now parse the generated template (i.e., buf) and execute it.
 	templ, err = template.New("pod_template").Delims("{{{{", "}}}}").Parse(buf.String())
 	if err != nil {
-		return "", errors.Wrap(err, "error parsing systemd service template")
+		return "", fmt.Errorf("parsing systemd service template: %w", err)
 	}
 
 	buf = bytes.Buffer{}

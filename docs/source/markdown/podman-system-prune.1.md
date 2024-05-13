@@ -1,22 +1,30 @@
-% podman-system-prune(1)
+% podman-system-prune 1
 
 ## NAME
-podman\-system\-prune - Remove all unused pod, container, image and volume data
+podman\-system\-prune - Remove all unused pods, containers, images, networks, and volume data
 
 ## SYNOPSIS
 **podman system prune** [*options*]
 
 ## DESCRIPTION
-**podman system prune** removes all unused containers (both dangling and unreferenced), pods and optionally, volumes from local storage.
+**podman system prune** removes all unused containers (both dangling and unreferenced), pods, networks, and optionally, volumes from local storage.
 
-With the **--all** option, you can delete all unused images.  Unused images are dangling images as well as any image that does not have any containers based on it.
+Use the **--all** option to delete all unused images.  Unused images are dangling images as well as any image that does not have any containers based on it.
 
 By default, volumes are not removed to prevent important data from being deleted if there is currently no container using the volume. Use the **--volumes** flag when running the command to prune volumes as well.
 
 ## OPTIONS
 #### **--all**, **-a**
 
-Recursively remove all unused pod, container, image and volume data (Maximum 50 iterations.)
+Recursively remove all unused pods, containers, images, networks, and volume data. (Maximum 50 iterations.)
+
+#### **--external**
+
+Removes all leftover container storage files from local storage not managed by Podman. In normal circumstances, no such data exists, but in case of an unclean shutdown, the Podman database may be corrupted and cause this.
+
+However, when using transient storage mode, the Podman database does not persist. This means containers leave the writable layers on disk after a reboot. When using a transient store, it is recommended that the **podman system prune --external** command is run during boot.
+
+This option is incompatible with **--all** and **--filter** and drops the default behaviour of removing unused resources.
 
 #### **--filter**=*filters*
 
@@ -26,10 +34,10 @@ The *filters* argument format is of `key=value`. If there is more than one *filt
 
 Supported filters:
 
-| Filter             | Description                                                                 |
-| :----------------: | --------------------------------------------------------------------------- |
-| *label*            | Only remove containers and images, with (or without, in the case of label!=[...] is used) the specified labels.                  |
-| *until*            | Only remove containers and images created before given timestamp.           |
+| Filter | Description                                                                                                     |
+|:------:|-----------------------------------------------------------------------------------------------------------------|
+| label  | Only remove containers and images, with (or without, in the case of label!=[...] is used) the specified labels. |
+| until  | Only remove containers and images created before given timestamp.                                               |
 
 The `label` *filter* accepts two formats. One is the `label`=*key* or `label`=*key*=*value*, which removes containers and images with the specified labels. The other format is the `label!`=*key* or `label!`=*key*=*value*, which removes containers and images without the specified labels.
 

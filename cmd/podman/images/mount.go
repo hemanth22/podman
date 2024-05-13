@@ -1,14 +1,14 @@
 package images
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/containers/common/pkg/report"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -84,7 +84,7 @@ func mount(cmd *cobra.Command, args []string) error {
 	case mountOpts.Format == "":
 		break // see default format below
 	default:
-		return errors.Errorf("unknown --format argument: %q", mountOpts.Format)
+		return fmt.Errorf("unknown --format argument: %q", mountOpts.Format)
 	}
 
 	mrs := make([]mountReporter, 0, len(reports))

@@ -1,5 +1,4 @@
 //go:build amd64 || arm64
-// +build amd64 arm64
 
 package machine
 
@@ -13,11 +12,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/validate"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/pkg/machine"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/pkg/machine/env"
+	provider2 "github.com/containers/podman/v5/pkg/machine/provider"
+	"github.com/containers/podman/v5/pkg/machine/vmconfigs"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -40,10 +41,23 @@ var (
 	}
 )
 
+var (
+	provider vmconfigs.VMProvider
+)
+
 func init() {
 	registry.Commands = append(registry.Commands, registry.CliCommand{
 		Command: machineCmd,
 	})
+}
+
+func machinePreRunE(c *cobra.Command, args []string) error {
+	var err error
+	provider, err = provider2.Get()
+	if err != nil {
+		return err
+	}
+	return rootlessOnly(c, args)
 }
 
 // autocompleteMachineSSH - Autocomplete machine ssh command.
@@ -64,8 +78,15 @@ func autocompleteMachine(cmd *cobra.Command, args []string, toComplete string) (
 
 func getMachines(toComplete string) ([]string, cobra.ShellCompDirective) {
 	suggestions := []string{}
-	provider := GetSystemDefaultProvider()
-	machines, err := provider.List(machine.ListOptions{})
+	provider, err := provider2.Get()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	dirs, err := env.GetMachineDirs(provider.VMType())
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	machines, err := vmconfigs.LoadMachinesInDir(dirs)
 	if err != nil {
 		cobra.CompErrorln(err.Error())
 		return nil, cobra.ShellCompDirectiveNoFileComp
@@ -101,12 +122,6 @@ func resolveEventSock() ([]string, error) {
 		return []string{sock}, nil
 	}
 
-	xdg, err := util.GetRuntimeDir()
-	if err != nil {
-		logrus.Warnf("Failed to get runtime dir, machine events will not be published: %s", err)
-		return nil, nil
-	}
-
 	re := regexp.MustCompile(`machine_events.*\.sock`)
 	sockPaths := make([]string, 0)
 	fn := func(path string, info os.DirEntry, err error) error {
@@ -125,14 +140,26 @@ func resolveEventSock() ([]string, error) {
 		sockPaths = append(sockPaths, path)
 		return nil
 	}
+	sockDir, err := eventSockDir()
+	if err != nil {
+		logrus.Warnf("Failed to get runtime dir, machine events will not be published: %s", err)
+	}
 
-	if err := filepath.WalkDir(filepath.Join(xdg, "podman"), fn); err != nil {
+	if err := filepath.WalkDir(sockDir, fn); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
 	return sockPaths, nil
+}
+
+func eventSockDir() (string, error) {
+	xdg, err := util.GetRootlessRuntimeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(xdg, "podman"), nil
 }
 
 func newMachineEvent(status events.Status, event events.Event) {

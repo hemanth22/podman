@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/rootless"
 	"github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
 	"github.com/sirupsen/logrus"
@@ -129,7 +129,11 @@ func dbusAuthRootlessConnection(createBus func(opts ...godbus.ConnOption) (*godb
 func newRootlessConnection() (*dbus.Conn, error) {
 	return dbus.NewConnection(func() (*godbus.Conn, error) {
 		return dbusAuthRootlessConnection(func(opts ...godbus.ConnOption) (*godbus.Conn, error) {
-			path := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "systemd/private")
+			path := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "systemd", "private")
+			path, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return nil, err
+			}
 			return godbus.Dial(fmt.Sprintf("unix:path=%s", path))
 		})
 	})

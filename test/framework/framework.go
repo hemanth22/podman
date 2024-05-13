@@ -3,7 +3,7 @@ package framework
 import (
 	"fmt"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
 
@@ -37,7 +37,7 @@ func NilFunc(f *TestFramework) error {
 func (t *TestFramework) Setup() {
 	// Global initialization for the whole framework goes in here
 
-	// Setup the actual test suite
+	// Set up the actual test suite
 	gomega.Expect(t.setup(t)).To(gomega.Succeed())
 }
 

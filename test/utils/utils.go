@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -12,10 +11,15 @@ import (
 	"strings"
 	"time"
 
+	crypto_rand "crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+
 	"github.com/sirupsen/logrus"
 
 	"github.com/containers/storage/pkg/parsers/kernel"
-	. "github.com/onsi/ginkgo"       //nolint:revive,stylecheck
+	. "github.com/onsi/ginkgo/v2"    //nolint:revive,stylecheck
 	. "github.com/onsi/gomega"       //nolint:revive,stylecheck
 	. "github.com/onsi/gomega/gexec" //nolint:revive,stylecheck
 )
@@ -61,6 +65,7 @@ type PodmanTest struct {
 	ImageCacheDir      string
 	ImageCacheFS       string
 	NetworkBackend     NetworkBackend
+	DatabaseBackend    string
 	PodmanBinary       string
 	PodmanMakeOptions  func(args []string, noEvents, noCache bool) []string
 	RemoteCommand      *exec.Cmd
@@ -100,7 +105,7 @@ func (p *PodmanTest) PodmanAsUserBase(args []string, uid, gid uint32, cwd string
 	}
 
 	if timeDir := os.Getenv(EnvTimeDir); timeDir != "" {
-		timeFile, err := ioutil.TempFile(timeDir, ".time")
+		timeFile, err := os.CreateTemp(timeDir, ".time")
 		if err != nil {
 			Fail(fmt.Sprintf("Error creating time file: %v", err))
 		}
@@ -110,14 +115,11 @@ func (p *PodmanTest) PodmanAsUserBase(args []string, uid, gid uint32, cwd string
 	}
 	runCmd := wrapper
 	runCmd = append(runCmd, podmanBinary)
-	if !p.RemoteTest && p.NetworkBackend == Netavark {
-		runCmd = append(runCmd, []string{"--network-backend", "netavark"}...)
-	}
 
 	if env == nil {
-		fmt.Printf("Running: %s %s\n", strings.Join(runCmd, " "), strings.Join(podmanOptions, " "))
+		GinkgoWriter.Printf("Running: %s %s\n", strings.Join(runCmd, " "), strings.Join(podmanOptions, " "))
 	} else {
-		fmt.Printf("Running: (env: %v) %s %s\n", env, strings.Join(runCmd, " "), strings.Join(podmanOptions, " "))
+		GinkgoWriter.Printf("Running: (env: %v) %s %s\n", env, strings.Join(runCmd, " "), strings.Join(podmanOptions, " "))
 	}
 	if uid != 0 || gid != 0 {
 		pythonCmd := fmt.Sprintf("import os; import sys; uid = %d; gid = %d; cwd = '%s'; os.setgid(gid); os.setuid(uid); os.chdir(cwd) if len(cwd)>0 else True; os.execv(sys.argv[1], sys.argv[1:])", gid, uid, cwd)
@@ -157,7 +159,7 @@ func (p *PodmanTest) WaitForContainer() bool {
 		}
 		time.Sleep(1 * time.Second)
 	}
-	fmt.Printf("WaitForContainer(): timed out\n")
+	GinkgoWriter.Printf("WaitForContainer(): timed out\n")
 	return false
 }
 
@@ -223,13 +225,13 @@ func (p *PodmanTest) WaitContainerReady(id string, expStr string, timeout int, s
 	s.WaitWithDefaultTimeout()
 
 	for {
-		if time.Since(startTime) >= time.Duration(timeout)*time.Second {
-			fmt.Printf("Container %s is not ready in %ds", id, timeout)
-			return false
+		if strings.Contains(s.OutputToString(), expStr) || strings.Contains(s.ErrorToString(), expStr) {
+			return true
 		}
 
-		if strings.Contains(s.OutputToString(), expStr) {
-			return true
+		if time.Since(startTime) >= time.Duration(timeout)*time.Second {
+			GinkgoWriter.Printf("Container %s is not ready in %ds", id, timeout)
+			return false
 		}
 		time.Sleep(time.Duration(step) * time.Second)
 		s = p.PodmanBase([]string{"logs", id}, false, true)
@@ -352,7 +354,7 @@ func (s *PodmanSession) LineInOutputContainsTag(repo, tag string) bool {
 func (s *PodmanSession) IsJSONOutputValid() bool {
 	var i interface{}
 	if err := json.Unmarshal(s.Out.Contents(), &i); err != nil {
-		fmt.Println(err)
+		GinkgoWriter.Println(err)
 		return false
 	}
 	return true
@@ -365,21 +367,19 @@ func (s *PodmanSession) WaitWithDefaultTimeout() {
 
 // WaitWithTimeout waits for process finished with DefaultWaitTimeout
 func (s *PodmanSession) WaitWithTimeout(timeout int) {
-	Eventually(s, timeout).Should(Exit())
+	Eventually(s, timeout).Should(Exit(), func() string {
+		// in case of timeouts show output
+		return fmt.Sprintf("command timed out after %ds: %v\nSTDOUT: %s\nSTDERR: %s",
+			timeout, s.Command.Args, string(s.Out.Contents()), string(s.Err.Contents()))
+	})
 	os.Stdout.Sync()
 	os.Stderr.Sync()
-	fmt.Println("output:", s.OutputToString())
-}
-
-// CreateTempDirInTempDir create a temp dir with prefix podman_test
-func CreateTempDirInTempDir() (string, error) {
-	return ioutil.TempDir("", "podman_test")
 }
 
 // SystemExec is used to exec a system command to check its exit code or output
 func SystemExec(command string, args []string) *PodmanSession {
 	c := exec.Command(command, args...)
-	fmt.Println("Execing " + c.String() + "\n")
+	GinkgoWriter.Println("Execing " + c.String() + "\n")
 	session, err := Start(c, GinkgoWriter, GinkgoWriter)
 	if err != nil {
 		Fail(fmt.Sprintf("unable to run command: %s %s", command, strings.Join(args, " ")))
@@ -391,22 +391,12 @@ func SystemExec(command string, args []string) *PodmanSession {
 // StartSystemExec is used to start exec a system command
 func StartSystemExec(command string, args []string) *PodmanSession {
 	c := exec.Command(command, args...)
-	fmt.Println("Execing " + c.String() + "\n")
+	GinkgoWriter.Println("Execing " + c.String() + "\n")
 	session, err := Start(c, GinkgoWriter, GinkgoWriter)
 	if err != nil {
 		Fail(fmt.Sprintf("unable to run command: %s %s", command, strings.Join(args, " ")))
 	}
 	return &PodmanSession{session}
-}
-
-// StringInSlice determines if a string is in a string slice, returns bool
-func StringInSlice(s string, sl []string) bool {
-	for _, i := range sl {
-		if i == s {
-			return true
-		}
-	}
-	return false
 }
 
 // tagOutPutToMap parses each string in imagesOutput and returns
@@ -496,7 +486,7 @@ func WriteJSONFile(data []byte, filePath string) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filePath, formatJSON, 0644)
+	return os.WriteFile(filePath, formatJSON, 0644)
 }
 
 // Containerized check the podman command run inside container
@@ -505,7 +495,7 @@ func Containerized() bool {
 	if container != "" {
 		return true
 	}
-	b, err := ioutil.ReadFile(ProcessOneCgroupPath)
+	b, err := os.ReadFile(ProcessOneCgroupPath)
 	if err != nil {
 		// shrug, if we cannot read that file, return false
 		return false
@@ -522,4 +512,77 @@ func RandomString(n int) string {
 		b[i] = randomLetters[rand.Intn(len(randomLetters))]
 	}
 	return string(b)
+}
+
+// Encode *rsa.PublicKey and store it in a file.
+// Adds appropriate extension to the fileName, and returns the complete fileName of
+// the file storing the public key.
+func savePublicKey(fileName string, publicKey *rsa.PublicKey) (string, error) {
+	// Encode public key to PKIX, ASN.1 DER form
+	pubBytes, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		return "", err
+	}
+
+	pubPEM := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PUBLIC KEY",
+			Bytes: pubBytes,
+		},
+	)
+
+	// Write public key to file
+	publicKeyFileName := fileName + ".rsa.pub"
+	if err := os.WriteFile(publicKeyFileName, pubPEM, 0600); err != nil {
+		return "", err
+	}
+
+	return publicKeyFileName, nil
+}
+
+// Encode *rsa.PrivateKey and store it in a file.
+// Adds appropriate extension to the fileName, and returns the complete fileName of
+// the file storing the private key.
+func savePrivateKey(fileName string, privateKey *rsa.PrivateKey) (string, error) {
+	// Encode private key to PKCS#1, ASN.1 DER form
+	privBytes := x509.MarshalPKCS1PrivateKey(privateKey)
+	keyPEM := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: privBytes,
+		},
+	)
+
+	// Write private key to file
+	privateKeyFileName := fileName + ".rsa"
+	if err := os.WriteFile(privateKeyFileName, keyPEM, 0600); err != nil {
+		return "", err
+	}
+
+	return privateKeyFileName, nil
+}
+
+// Generate RSA key pair of specified bit size and write them to files.
+// Adds appropriate extension to the fileName, and returns the complete fileName of
+// the files storing the public and private key respectively.
+func WriteRSAKeyPair(fileName string, bitSize int) (string, string, error) {
+	// Generate RSA key
+	privateKey, err := rsa.GenerateKey(crypto_rand.Reader, bitSize)
+	if err != nil {
+		return "", "", err
+	}
+
+	publicKey := privateKey.Public().(*rsa.PublicKey)
+
+	publicKeyFileName, err := savePublicKey(fileName, publicKey)
+	if err != nil {
+		return "", "", err
+	}
+
+	privateKeyFileName, err := savePrivateKey(fileName, privateKey)
+	if err != nil {
+		return "", "", err
+	}
+
+	return publicKeyFileName, privateKeyFileName, nil
 }

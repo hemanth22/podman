@@ -2,18 +2,18 @@ package containers
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 
 	"github.com/containers/common/pkg/completion"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/cmd/podman/validate"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -52,8 +52,10 @@ var (
 )
 
 var (
-	rmOptions = entities.RmOptions{}
-	cidFiles  = []string{}
+	rmOptions = entities.RmOptions{
+		Filters: make(map[string][]string),
+	}
+	rmCidFiles = []string{}
 )
 
 func rmFlags(cmd *cobra.Command) {
@@ -64,13 +66,17 @@ func rmFlags(cmd *cobra.Command) {
 	flags.BoolVarP(&rmOptions.Force, "force", "f", false, "Force removal of a running or unusable container")
 	flags.BoolVar(&rmOptions.Depend, "depend", false, "Remove container and all containers that depend on the selected container")
 	timeFlagName := "time"
-	flags.UintVarP(&stopTimeout, timeFlagName, "t", containerConfig.Engine.StopTimeout, "Seconds to wait for stop before killing the container")
+	flags.IntVarP(&stopTimeout, timeFlagName, "t", int(containerConfig.Engine.StopTimeout), "Seconds to wait for stop before killing the container")
 	_ = cmd.RegisterFlagCompletionFunc(timeFlagName, completion.AutocompleteNone)
 	flags.BoolVarP(&rmOptions.Volumes, "volumes", "v", false, "Remove anonymous volumes associated with the container")
 
 	cidfileFlagName := "cidfile"
-	flags.StringArrayVar(&cidFiles, cidfileFlagName, nil, "Read the container ID from the file")
+	flags.StringArrayVar(&rmCidFiles, cidfileFlagName, nil, "Read the container ID from the file")
 	_ = cmd.RegisterFlagCompletionFunc(cidfileFlagName, completion.AutocompleteDefault)
+
+	filterFlagName := "filter"
+	flags.StringArrayVar(&filters, filterFlagName, []string{}, "Filter output based on conditions given")
+	_ = cmd.RegisterFlagCompletionFunc(filterFlagName, common.AutocompletePsFilters)
 
 	if !registry.IsRemote() {
 		// This option is deprecated, but needs to still exists for backwards compatibility
@@ -99,30 +105,45 @@ func rm(cmd *cobra.Command, args []string) error {
 		if !rmOptions.Force {
 			return errors.New("--force option must be specified to use the --time option")
 		}
-		rmOptions.Timeout = &stopTimeout
+		timeout := uint(stopTimeout)
+		rmOptions.Timeout = &timeout
 	}
-	for _, cidFile := range cidFiles {
-		content, err := ioutil.ReadFile(cidFile)
+	for _, cidFile := range rmCidFiles {
+		content, err := os.ReadFile(cidFile)
 		if err != nil {
-			return errors.Wrap(err, "error reading CIDFile")
+			if rmOptions.Ignore && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("reading CIDFile: %w", err)
 		}
-		id := strings.Split(string(content), "\n")[0]
+		id, _, _ := strings.Cut(string(content), "\n")
 		args = append(args, id)
+	}
+
+	for _, f := range filters {
+		fname, filter, hasFilter := strings.Cut(f, "=")
+		if !hasFilter {
+			return fmt.Errorf("invalid filter %q", f)
+		}
+		rmOptions.Filters[fname] = append(rmOptions.Filters[fname], filter)
 	}
 
 	if rmOptions.All {
 		logrus.Debug("--all is set: enforcing --depend=true")
 		rmOptions.Depend = true
 	}
+	if rmOptions.Force {
+		rmOptions.Ignore = true
+	}
 
-	return removeContainers(args, rmOptions, true)
+	return removeContainers(utils.RemoveSlash(args), rmOptions, true, false)
 }
 
 // removeContainers will remove the specified containers (names or IDs).
 // Allows for sharing removal logic across commands. If setExit is set,
 // removeContainers will set the exit code according to the `podman-rm` man
 // page.
-func removeContainers(namesOrIDs []string, rmOptions entities.RmOptions, setExit bool) error {
+func removeContainers(namesOrIDs []string, rmOptions entities.RmOptions, setExit bool, quiet bool) error {
 	var errs utils.OutputErrors
 	responses, err := registry.ContainerEngine().ContainerRm(context.Background(), namesOrIDs, rmOptions)
 	if err != nil {
@@ -132,18 +153,23 @@ func removeContainers(namesOrIDs []string, rmOptions entities.RmOptions, setExit
 		return err
 	}
 	for _, r := range responses {
-		if r.Err != nil {
-			// When using the API, errors.Cause(err) will never equal constant define.ErrWillDeadLock
-			if errors.Cause(r.Err) == define.ErrWillDeadlock ||
-				errors.Cause(r.Err).Error() == define.ErrWillDeadlock.Error() {
+		switch {
+		case r.Err != nil:
+			if errors.Is(r.Err, define.ErrWillDeadlock) {
 				logrus.Errorf("Potential deadlock detected - please run 'podman system renumber' to resolve")
 			}
 			if setExit {
 				setExitCode(r.Err)
 			}
 			errs = append(errs, r.Err)
-		} else {
-			fmt.Println(r.Id)
+		case r.RawInput != "":
+			if !quiet {
+				fmt.Println(r.RawInput)
+			}
+		default:
+			if !quiet {
+				fmt.Println(r.Id)
+			}
 		}
 	}
 	return errs.PrintErrors()
@@ -154,15 +180,9 @@ func setExitCode(err error) {
 	if registry.GetExitCode() == 1 {
 		return
 	}
-	cause := errors.Cause(err)
-	switch {
-	case cause == define.ErrNoSuchCtr:
+	if errors.Is(err, define.ErrNoSuchCtr) || strings.Contains(err.Error(), define.ErrNoSuchCtr.Error()) {
 		registry.SetExitCode(1)
-	case strings.Contains(cause.Error(), define.ErrNoSuchCtr.Error()):
-		registry.SetExitCode(1)
-	case cause == define.ErrCtrStateInvalid:
-		registry.SetExitCode(2)
-	case strings.Contains(cause.Error(), define.ErrCtrStateInvalid.Error()):
+	} else if errors.Is(err, define.ErrCtrStateInvalid) || strings.Contains(err.Error(), define.ErrCtrStateInvalid.Error()) {
 		registry.SetExitCode(2)
 	}
 }

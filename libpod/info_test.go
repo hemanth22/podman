@@ -1,10 +1,12 @@
+//go:build !remote && linux
+
 package libpod
 
 import (
 	"fmt"
 	"testing"
 
-	"github.com/containers/podman/v4/libpod/define"
+	"github.com/containers/podman/v5/libpod/define"
 	"github.com/stretchr/testify/assert"
 )
 

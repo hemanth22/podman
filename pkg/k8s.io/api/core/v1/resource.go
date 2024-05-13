@@ -17,7 +17,7 @@ limitations under the License.
 package v1
 
 import (
-	"github.com/containers/podman/v4/pkg/k8s.io/apimachinery/pkg/api/resource"
+	"github.com/containers/podman/v5/pkg/k8s.io/apimachinery/pkg/api/resource"
 )
 
 // Returns string version of ResourceName.
@@ -26,6 +26,7 @@ func (rn ResourceName) String() string {
 }
 
 // Cpu returns the Cpu limit if specified.
+//
 //nolint:revive,stylecheck
 func (rl *ResourceList) Cpu() *resource.Quantity {
 	return rl.Name(ResourceCPU, resource.DecimalSI)

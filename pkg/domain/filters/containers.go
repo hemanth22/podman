@@ -1,42 +1,52 @@
+//go:build !remote
+
 package filters
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	cutil "github.com/containers/common/pkg/util"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/common/pkg/filters"
+	"github.com/containers/common/pkg/util"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
 )
 
 // GenerateContainerFilterFuncs return ContainerFilter functions based of filter.
 func GenerateContainerFilterFuncs(filter string, filterValues []string, r *libpod.Runtime) (func(container *libpod.Container) bool, error) {
 	switch filter {
 	case "id":
-		// we only have to match one ID
 		return func(c *libpod.Container) bool {
-			return util.StringMatchRegexSlice(c.ID(), filterValues)
+			return filters.FilterID(c.ID(), filterValues)
 		}, nil
 	case "label":
 		// we have to match that all given labels exits on that container
 		return func(c *libpod.Container) bool {
-			return util.MatchLabelFilters(filterValues, c.Labels())
+			return filters.MatchLabelFilters(filterValues, c.Labels())
+		}, nil
+	case "label!":
+		return func(c *libpod.Container) bool {
+			return !filters.MatchLabelFilters(filterValues, c.Labels())
 		}, nil
 	case "name":
 		// we only have to match one name
 		return func(c *libpod.Container) bool {
-			return util.StringMatchRegexSlice(c.Name(), filterValues)
+			var filters []string
+			for _, f := range filterValues {
+				filters = append(filters, strings.ReplaceAll(f, "/", ""))
+			}
+			return util.StringMatchRegexSlice(c.Name(), filters)
 		}, nil
 	case "exited":
 		var exitCodes []int32
 		for _, exitCode := range filterValues {
 			ec, err := strconv.ParseInt(exitCode, 10, 32)
 			if err != nil {
-				return nil, errors.Wrapf(err, "exited code out of range %q", ec)
+				return nil, fmt.Errorf("exited code out of range %q: %w", ec, err)
 			}
 			exitCodes = append(exitCodes, int32(ec))
 		}
@@ -83,20 +93,20 @@ func GenerateContainerFilterFuncs(filter string, filterValues []string, r *libpo
 		// - ancestor=(<image-name>[:tag]|<image-id>| ⟨image@digest⟩) - containers created from an image or a descendant.
 		return func(c *libpod.Container) bool {
 			for _, filterValue := range filterValues {
-				containerConfig := c.Config()
+				rootfsImageID, rootfsImageName := c.Image()
 				var imageTag string
 				var imageNameWithoutTag string
 				// Compare with ImageID, ImageName
 				// Will match ImageName if running image has tag latest for other tags exact complete filter must be given
-				imageNameSlice := strings.SplitN(containerConfig.RootfsImageName, ":", 2)
-				if len(imageNameSlice) == 2 {
-					imageNameWithoutTag = imageNameSlice[0]
-					imageTag = imageNameSlice[1]
+				name, tag, hasColon := strings.Cut(rootfsImageName, ":")
+				if hasColon {
+					imageNameWithoutTag = name
+					imageTag = tag
 				}
 
-				if (containerConfig.RootfsImageID == filterValue) ||
-					(containerConfig.RootfsImageName == filterValue) ||
-					(imageNameWithoutTag == filterValue && imageTag == "latest") {
+				if (rootfsImageID == filterValue) ||
+					util.StringMatchRegexSlice(rootfsImageName, filterValues) ||
+					(util.StringMatchRegexSlice(imageNameWithoutTag, filterValues) && imageTag == "latest") {
 					return true
 				}
 			}
@@ -109,14 +119,12 @@ func GenerateContainerFilterFuncs(filter string, filterValues []string, r *libpo
 			if err != nil {
 				return nil, err
 			}
-			containerConfig := ctr.Config()
-			if createTime.IsZero() || createTime.After(containerConfig.CreatedTime) {
-				createTime = containerConfig.CreatedTime
+			if createTime.IsZero() || createTime.After(ctr.CreatedTime()) {
+				createTime = ctr.CreatedTime()
 			}
 		}
 		return func(c *libpod.Container) bool {
-			cc := c.Config()
-			return createTime.After(cc.CreatedTime)
+			return createTime.After(c.CreatedTime())
 		}, nil
 	case "since":
 		var createTime time.Time
@@ -125,31 +133,24 @@ func GenerateContainerFilterFuncs(filter string, filterValues []string, r *libpo
 			if err != nil {
 				return nil, err
 			}
-			containerConfig := ctr.Config()
-			if createTime.IsZero() || createTime.After(containerConfig.CreatedTime) {
-				createTime = containerConfig.CreatedTime
+			if createTime.IsZero() || createTime.After(ctr.CreatedTime()) {
+				createTime = ctr.CreatedTime()
 			}
 		}
 		return func(c *libpod.Container) bool {
-			cc := c.Config()
-			return createTime.Before(cc.CreatedTime)
+			return createTime.Before(c.CreatedTime())
 		}, nil
 	case "volume":
 		//- volume=(<volume-name>|<mount-point-destination>)
 		return func(c *libpod.Container) bool {
-			containerConfig := c.Config()
-			var dest string
+			containerConfig := c.ConfigNoCopy()
 			for _, filterValue := range filterValues {
-				arr := strings.SplitN(filterValue, ":", 2)
-				source := arr[0]
-				if len(arr) == 2 {
-					dest = arr[1]
-				}
+				source, dest, _ := strings.Cut(filterValue, ":")
 				for _, mount := range containerConfig.Spec.Mounts {
 					if dest != "" && (mount.Source == source && mount.Destination == dest) {
 						return true
 					}
-					if dest == "" && mount.Source == source {
+					if dest == "" && mount.Destination == source {
 						return true
 					}
 				}
@@ -184,7 +185,7 @@ func GenerateContainerFilterFuncs(filter string, filterValues []string, r *libpo
 		for _, podNameOrID := range filterValues {
 			p, err := r.LookupPod(podNameOrID)
 			if err != nil {
-				if errors.Cause(err) == define.ErrNoSuchPod {
+				if errors.Is(err, define.ErrNoSuchPod) {
 					continue
 				}
 				return nil, err
@@ -227,19 +228,10 @@ func GenerateContainerFilterFuncs(filter string, filterValues []string, r *libpo
 			// check if networkMode is configured as `container:<ctr>`
 			// perform a match against filter `container:<IDorName>`
 			// networks is already going to be empty if `container:<ctr>` is configured as Mode
-			if strings.HasPrefix(networkMode, "container:") {
-				networkModeContainerPart := strings.SplitN(networkMode, ":", 2)
-				if len(networkModeContainerPart) < 2 {
-					return false
-				}
-				networkModeContainerID := networkModeContainerPart[1]
+			if networkModeContainerID, ok := strings.CutPrefix(networkMode, "container:"); ok {
 				for _, val := range filterValues {
-					if strings.HasPrefix(val, "container:") {
-						filterNetworkModePart := strings.SplitN(val, ":", 2)
-						if len(filterNetworkModePart) < 2 {
-							return false
-						}
-						filterNetworkModeIDorName := filterNetworkModePart[1]
+					if idOrName, ok := strings.CutPrefix(val, "container:"); ok {
+						filterNetworkModeIDorName := idOrName
 						filterID, err := r.LookupContainerID(filterNetworkModeIDorName)
 						if err != nil {
 							return false
@@ -258,7 +250,7 @@ func GenerateContainerFilterFuncs(filter string, filterValues []string, r *libpo
 				return false
 			}
 			for _, net := range networks {
-				if cutil.StringInSlice(net, inputNetNames) {
+				if slices.Contains(inputNetNames, net) {
 					return true
 				}
 			}
@@ -291,7 +283,7 @@ func GenerateContainerFilterFuncs(filter string, filterValues []string, r *libpo
 			return false
 		}, filterValueError
 	}
-	return nil, errors.Errorf("%s is an invalid filter", filter)
+	return nil, fmt.Errorf("%s is an invalid filter", filter)
 }
 
 // GeneratePruneContainerFilterFuncs return ContainerFilter functions based of filter for prune operation
@@ -299,16 +291,20 @@ func GeneratePruneContainerFilterFuncs(filter string, filterValues []string, r *
 	switch filter {
 	case "label":
 		return func(c *libpod.Container) bool {
-			return util.MatchLabelFilters(filterValues, c.Labels())
+			return filters.MatchLabelFilters(filterValues, c.Labels())
+		}, nil
+	case "label!":
+		return func(c *libpod.Container) bool {
+			return !filters.MatchLabelFilters(filterValues, c.Labels())
 		}, nil
 	case "until":
 		return prepareUntilFilterFunc(filterValues)
 	}
-	return nil, errors.Errorf("%s is an invalid filter", filter)
+	return nil, fmt.Errorf("%s is an invalid filter", filter)
 }
 
 func prepareUntilFilterFunc(filterValues []string) (func(container *libpod.Container) bool, error) {
-	until, err := util.ComputeUntilTimestamp(filterValues)
+	until, err := filters.ComputeUntilTimestamp(filterValues)
 	if err != nil {
 		return nil, err
 	}

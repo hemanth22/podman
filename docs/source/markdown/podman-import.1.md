@@ -1,4 +1,4 @@
-% podman-import(1)
+% podman-import 1
 
 ## NAME
 podman\-import - Import a tarball and save it as a filesystem image
@@ -23,7 +23,7 @@ Note: `:` is a restricted character and cannot be part of the file name.
 
 Set architecture of the imported image.
 
-#### **--change**=*instruction*, **-c**
+#### **--change**, **-c**=*instruction*
 
 Apply the following possible instructions to the created image:
 **CMD** | **ENTRYPOINT** | **ENV** | **EXPOSE** | **LABEL** | **STOPSIGNAL** | **USER** | **VOLUME** | **WORKDIR**
@@ -50,12 +50,9 @@ Shows progress on the import
 
 Set variant of the imported image.
 
-**--verbose**
-
-Print additional debugging information
-
 ## EXAMPLES
 
+Import the selected tarball into new image, specifying the CMD, ENTRYPOINT and LABEL:
 ```
 $ podman import --change CMD=/bin/bash --change ENTRYPOINT=/bin/sh --change LABEL=blue=image ctr.tar image-imported
 Getting image source signatures
@@ -68,6 +65,7 @@ Storing signatures
 db65d991f3bbf7f31ed1064db9a6ced7652e3f8166c4736aa9133dadd3c7acb3
 ```
 
+Import the selected tarball into new image, specifying the CMD, ENTRYPOINT and LABEL:
 ```
 $ podman import --change 'ENTRYPOINT ["/bin/sh","-c","test-image"]'  --change LABEL=blue=image test-image.tar image-imported
 Getting image source signatures
@@ -77,22 +75,14 @@ Writing manifest to image destination
 Storing signatures
 110552350206337183ceadc0bdd646dc356e06514c548b69a8917b4182414b
 ```
-```
-$ podman import --change "CMD /bin/sh"  --change LABEL=blue=image test-image.tar image-imported
-Getting image source signatures
-Copying blob e3b0c44298fc skipped: already exists
-Copying config ae9a27e249 done
-Writing manifest to image destination
-Storing signatures
-ae9a27e249f801aff11a4ba54a81751ea9fbc9db45a6df3f1bfd63fc2437bb9c
-```
 
-
+Import new tagged image from stdin in quiet mode:
 ```
-$ cat ctr.tar | podman -q import --message "importing the ctr.tar tarball" - image-imported
+$ cat ctr.tar | podman -q import --message "importing the ctr.tar file" - image-imported
 db65d991f3bbf7f31ed1064db9a6ced7652e3f8166c4736aa9133dadd3c7acb3
 ```
 
+Import an image from stdin:
 ```
 $ cat ctr.tar | podman import -
 Getting image source signatures
@@ -105,6 +95,7 @@ Storing signatures
 db65d991f3bbf7f31ed1064db9a6ced7652e3f8166c4736aa9133dadd3c7acb3
 ```
 
+Import named image from tarball via a URL:
 ```
 $ podman import http://example.com/ctr.tar url-image
 Downloading from "http://example.com/ctr.tar"

@@ -2,30 +2,28 @@ package filedriver
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 
+	"github.com/containers/common/pkg/secrets/define"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/lockfile"
-	"github.com/pkg/errors"
+	"golang.org/x/exp/maps"
 )
 
 // secretsDataFile is the file where secrets data/payload will be stored
 var secretsDataFile = "secretsdata.json"
-
-// errNoSecretData indicates that there is not data associated with an id
-var errNoSecretData = errors.New("no secret data with ID")
-
-// errNoSecretData indicates that there is secret data already associated with an id
-var errSecretIDExists = errors.New("secret data with ID already exists")
 
 // Driver is the filedriver object
 type Driver struct {
 	// secretsDataFilePath is the path to the secretsfile
 	secretsDataFilePath string
 	// lockfile is the filedriver lockfile
-	lockfile lockfile.Locker
+	lockfile *lockfile.LockFile
 }
 
 // NewDriver creates a new file driver.
@@ -38,7 +36,7 @@ func NewDriver(rootPath string) (*Driver, error) {
 		return nil, err
 	}
 
-	lock, err := lockfile.GetLockfile(filepath.Join(rootPath, "secretsdata.lock"))
+	lock, err := lockfile.GetLockFile(filepath.Join(rootPath, "secretsdata.lock"))
 	if err != nil {
 		return nil, err
 	}
@@ -55,10 +53,7 @@ func (d *Driver) List() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	allID := make([]string, 0, len(secretData))
-	for k := range secretData {
-		allID = append(allID, k)
-	}
+	allID := maps.Keys(secretData)
 	sort.Strings(allID)
 	return allID, err
 }
@@ -75,10 +70,10 @@ func (d *Driver) Lookup(id string) ([]byte, error) {
 	if data, ok := secretData[id]; ok {
 		return data, nil
 	}
-	return nil, errors.Wrapf(errNoSecretData, "%s", id)
+	return nil, fmt.Errorf("%s: %w", id, define.ErrNoSuchSecret)
 }
 
-// Store stores the bytes associated with an ID. An error is returned if the ID arleady exists
+// Store stores the bytes associated with an ID. An error is returned if the ID already exists
 func (d *Driver) Store(id string, data []byte) error {
 	d.lockfile.Lock()
 	defer d.lockfile.Unlock()
@@ -88,14 +83,14 @@ func (d *Driver) Store(id string, data []byte) error {
 		return err
 	}
 	if _, ok := secretData[id]; ok {
-		return errors.Wrapf(errSecretIDExists, "%s", id)
+		return fmt.Errorf("%s: %w", id, define.ErrSecretIDExists)
 	}
 	secretData[id] = data
 	marshalled, err := json.MarshalIndent(secretData, "", "  ")
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(d.secretsDataFilePath, marshalled, 0o600)
+	err = os.WriteFile(d.secretsDataFilePath, marshalled, 0o600)
 	if err != nil {
 		return err
 	}
@@ -113,13 +108,13 @@ func (d *Driver) Delete(id string) error {
 	if _, ok := secretData[id]; ok {
 		delete(secretData, id)
 	} else {
-		return errors.Wrap(errNoSecretData, id)
+		return fmt.Errorf("%s: %w", id, define.ErrNoSuchSecret)
 	}
 	marshalled, err := json.MarshalIndent(secretData, "", "  ")
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(d.secretsDataFilePath, marshalled, 0o600)
+	err = os.WriteFile(d.secretsDataFilePath, marshalled, 0o600)
 	if err != nil {
 		return err
 	}
@@ -129,9 +124,9 @@ func (d *Driver) Delete(id string) error {
 // getAllData reads the data file and returns all data
 func (d *Driver) getAllData() (map[string][]byte, error) {
 	// check if the db file exists
-	_, err := os.Stat(d.secretsDataFilePath)
+	err := fileutils.Exists(d.secretsDataFilePath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			// the file will be created later on a store()
 			return make(map[string][]byte), nil
 		}
@@ -144,12 +139,12 @@ func (d *Driver) getAllData() (map[string][]byte, error) {
 	}
 	defer file.Close()
 
-	byteValue, err := ioutil.ReadAll(file)
+	byteValue, err := io.ReadAll(file)
 	if err != nil {
 		return nil, err
 	}
 	secretData := new(map[string][]byte)
-	err = json.Unmarshal([]byte(byteValue), secretData)
+	err = json.Unmarshal(byteValue, secretData)
 	if err != nil {
 		return nil, err
 	}

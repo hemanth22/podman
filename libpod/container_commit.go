@@ -1,7 +1,10 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -9,32 +12,30 @@ import (
 	"github.com/containers/common/libimage"
 	is "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	libpodutil "github.com/containers/podman/v4/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
 	"github.com/sirupsen/logrus"
 )
 
 // ContainerCommitOptions is a struct used to commit a container to an image
 // It uses buildah's CommitOptions as a base. Long-term we might wish to
-// add these to the buildah struct once buildah is more integrated with
-// libpod
+// decouple these because it includes duplicates of fields that are in, or
+// could later be added, to buildah's CommitOptions, which gets confusing
 type ContainerCommitOptions struct {
 	buildah.CommitOptions
 	Pause          bool
 	IncludeVolumes bool
 	Author         string
 	Message        string
-	Changes        []string
-	Squash         bool
+	Changes        []string // gets merged with CommitOptions.OverrideChanges
+	Squash         bool     // always used instead of CommitOptions.Squash
 }
 
 // Commit commits the changes between a container and its image, creating a new
 // image
 func (c *Container) Commit(ctx context.Context, destImage string, options ContainerCommitOptions) (*libimage.Image, error) {
 	if c.config.Rootfs != "" {
-		return nil, errors.Errorf("cannot commit a container that uses an exploded rootfs")
+		return nil, errors.New("cannot commit a container that uses an exploded rootfs")
 	}
 
 	if !c.batched {
@@ -48,7 +49,7 @@ func (c *Container) Commit(ctx context.Context, destImage string, options Contai
 
 	if c.state.State == define.ContainerStateRunning && options.Pause {
 		if err := c.pause(); err != nil {
-			return nil, errors.Wrapf(err, "error pausing container %q to commit", c.ID())
+			return nil, fmt.Errorf("pausing container %q to commit: %w", c.ID(), err)
 		}
 		defer func() {
 			if err := c.unpause(); err != nil {
@@ -67,8 +68,11 @@ func (c *Container) Commit(ctx context.Context, destImage string, options Contai
 		Squash:                options.Squash,
 		SystemContext:         c.runtime.imageContext,
 		PreferredManifestType: options.PreferredManifestType,
+		OverrideChanges:       append(append([]string{}, options.Changes...), options.CommitOptions.OverrideChanges...),
+		OverrideConfig:        options.CommitOptions.OverrideConfig,
 	}
 	importBuilder, err := buildah.ImportBuilder(ctx, c.runtime.store, builderOptions)
+	importBuilder.Format = options.PreferredManifestType
 	if err != nil {
 		return nil, err
 	}
@@ -93,8 +97,8 @@ func (c *Container) Commit(ctx context.Context, destImage string, options Contai
 	// Should we store the ENV we actually want in the spec separately?
 	if c.config.Spec.Process != nil {
 		for _, e := range c.config.Spec.Process.Env {
-			splitEnv := strings.SplitN(e, "=", 2)
-			importBuilder.SetEnv(splitEnv[0], splitEnv[1])
+			key, val, _ := strings.Cut(e, "=")
+			importBuilder.SetEnv(key, val)
 		}
 	}
 	// Expose ports
@@ -136,7 +140,7 @@ func (c *Container) Commit(ctx context.Context, destImage string, options Contai
 			if include {
 				vol, err := c.runtime.GetVolume(v.Name)
 				if err != nil {
-					return nil, errors.Wrapf(err, "volume %s used in container %s has been removed", v.Name, c.ID())
+					return nil, fmt.Errorf("volume %s used in container %s has been removed: %w", v.Name, c.ID(), err)
 				}
 				if vol.Anonymous() {
 					importBuilder.AddVolume(v.Dest)
@@ -146,51 +150,6 @@ func (c *Container) Commit(ctx context.Context, destImage string, options Contai
 	}
 	// Workdir
 	importBuilder.SetWorkDir(c.config.Spec.Process.Cwd)
-
-	// Process user changes
-	newImageConfig, err := libpodutil.GetImageConfig(options.Changes)
-	if err != nil {
-		return nil, err
-	}
-	if newImageConfig.User != "" {
-		importBuilder.SetUser(newImageConfig.User)
-	}
-	// EXPOSE only appends
-	for port := range newImageConfig.ExposedPorts {
-		importBuilder.SetPort(port)
-	}
-	// ENV only appends
-	for _, env := range newImageConfig.Env {
-		splitEnv := strings.SplitN(env, "=", 2)
-		key := splitEnv[0]
-		value := ""
-		if len(splitEnv) == 2 {
-			value = splitEnv[1]
-		}
-		importBuilder.SetEnv(key, value)
-	}
-	if newImageConfig.Entrypoint != nil {
-		importBuilder.SetEntrypoint(newImageConfig.Entrypoint)
-	}
-	if newImageConfig.Cmd != nil {
-		importBuilder.SetCmd(newImageConfig.Cmd)
-	}
-	// VOLUME only appends
-	for vol := range newImageConfig.Volumes {
-		importBuilder.AddVolume(vol)
-	}
-	if newImageConfig.WorkingDir != "" {
-		importBuilder.SetWorkDir(newImageConfig.WorkingDir)
-	}
-	for k, v := range newImageConfig.Labels {
-		importBuilder.SetLabel(k, v)
-	}
-	if newImageConfig.StopSignal != "" {
-		importBuilder.SetStopSignal(newImageConfig.StopSignal)
-	}
-	for _, onbuild := range newImageConfig.OnBuild {
-		importBuilder.SetOnBuild(onbuild)
-	}
 
 	var commitRef types.ImageReference
 	if destImage != "" {
@@ -202,7 +161,7 @@ func (c *Container) Commit(ctx context.Context, destImage string, options Contai
 
 		imageRef, err := is.Transport.ParseStoreReference(c.runtime.store, resolvedImageName)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error parsing target image name %q", destImage)
+			return nil, fmt.Errorf("parsing target image name %q: %w", destImage, err)
 		}
 		commitRef = imageRef
 	}

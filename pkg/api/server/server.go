@@ -14,12 +14,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/shutdown"
-	"github.com/containers/podman/v4/pkg/api/handlers"
-	"github.com/containers/podman/v4/pkg/api/server/idle"
-	"github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/shutdown"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/server/idle"
+	"github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/schema"
@@ -69,7 +69,6 @@ func newServer(runtime *libpod.Runtime, listener net.Listener, opts entities.Ser
 		logrus.Debugf("CORS Headers were set to %q", opts.CorsHeaders)
 	}
 
-	logrus.Infof("API service listening on %q", listener.Addr())
 	router := mux.NewRouter().UseEncodedPath()
 	tracker := idle.NewTracker(opts.Timeout)
 
@@ -91,6 +90,7 @@ func newServer(runtime *libpod.Runtime, listener net.Listener, opts entities.Ser
 
 	server.BaseContext = func(l net.Listener) context.Context {
 		ctx := context.WithValue(context.Background(), types.DecoderKey, handlers.NewAPIDecoder())
+		ctx = context.WithValue(ctx, types.CompatDecoderKey, handlers.NewCompatAPIDecoder())
 		ctx = context.WithValue(ctx, types.RuntimeKey, runtime)
 		ctx = context.WithValue(ctx, types.IdleTrackerKey, tracker)
 		return ctx
@@ -130,7 +130,7 @@ func newServer(runtime *libpod.Runtime, listener net.Listener, opts entities.Ser
 		server.registerMonitorHandlers,
 		server.registerNetworkHandlers,
 		server.registerPingHandlers,
-		server.registerPlayHandlers,
+		server.registerKubeHandlers,
 		server.registerPluginsHandlers,
 		server.registerPodsHandlers,
 		server.registerSecretHandlers,
@@ -148,7 +148,7 @@ func newServer(runtime *libpod.Runtime, listener net.Listener, opts entities.Ser
 	if logrus.IsLevelEnabled(logrus.TraceLevel) {
 		// If in trace mode log request and response bodies
 		router.Use(loggingHandler())
-		router.Walk(func(route *mux.Route, r *mux.Router, ancestors []*mux.Route) error { // nolint
+		_ = router.Walk(func(route *mux.Route, r *mux.Router, ancestors []*mux.Route) error {
 			path, err := route.GetPathTemplate()
 			if err != nil {
 				path = "<N/A>"
@@ -167,7 +167,8 @@ func newServer(runtime *libpod.Runtime, listener net.Listener, opts entities.Ser
 
 // setupSystemd notifies systemd API service is ready
 // If the NOTIFY_SOCKET is set, communicate the PID and readiness, and unset INVOCATION_ID
-// so conmon and containers are in the correct cgroup.
+// so conmon and containers are in the correct cgroup.  Also unset NOTIFY_SOCKET
+// to avoid any further usage of the socket.
 func (s *APIServer) setupSystemd() {
 	if _, found := os.LookupEnv("NOTIFY_SOCKET"); !found {
 		return
@@ -176,13 +177,16 @@ func (s *APIServer) setupSystemd() {
 	payload := fmt.Sprintf("MAINPID=%d\n", os.Getpid())
 	payload += daemon.SdNotifyReady
 	if sent, err := daemon.SdNotify(true, payload); err != nil {
-		logrus.Error("API service failed to notify systemd of Conmon PID: " + err.Error())
+		logrus.Errorf("API service failed to notify systemd of Conmon PID: %v", err)
 	} else if !sent {
 		logrus.Warn("API service unable to successfully send SDNotify")
 	}
 
 	if err := os.Unsetenv("INVOCATION_ID"); err != nil {
-		logrus.Error("API service failed unsetting INVOCATION_ID: " + err.Error())
+		logrus.Errorf("API service failed unsetting INVOCATION_ID: %v", err)
+	}
+	if err := os.Unsetenv("NOTIFY_SOCKET"); err != nil {
+		logrus.Errorf("API service failed unsetting NOTIFY_SOCKET: %v", err)
 	}
 }
 

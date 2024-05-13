@@ -1,9 +1,13 @@
+//go:build !remote
+
 package libpod
 
 import (
 	"net/http"
 
-	"github.com/containers/podman/v4/libpod/define"
+	"github.com/containers/common/pkg/resize"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // OCIRuntime is an implementation of an OCI runtime.
@@ -14,7 +18,7 @@ import (
 // The code calling the OCIRuntime will manage this.
 // TODO: May want to move the conmon cleanup code here - it depends on
 // Conmon being in use.
-type OCIRuntime interface {
+type OCIRuntime interface { //nolint:interfacebloat
 	// Name returns the name of the runtime.
 	Name() string
 	// Path returns the path to the runtime executable.
@@ -66,7 +70,7 @@ type OCIRuntime interface {
 	// client.
 	HTTPAttach(ctr *Container, r *http.Request, w http.ResponseWriter, streams *HTTPAttachStreams, detachKeys *string, cancel <-chan bool, hijackDone chan<- bool, streamAttach, streamLogs bool) error
 	// AttachResize resizes the terminal in use by the given container.
-	AttachResize(ctr *Container, newSize define.TerminalSize) error
+	AttachResize(ctr *Container, newSize resize.TerminalSize) error
 
 	// ExecContainer executes a command in a running container.
 	// Returns an int (PID of exec session), error channel (errors from
@@ -76,7 +80,7 @@ type OCIRuntime interface {
 	// running, in a goroutine that will return via the chan error in the
 	// return signature.
 	// newSize resizes the tty to this size before the process is started, must be nil if the exec session has no tty
-	ExecContainer(ctr *Container, sessionID string, options *ExecOptions, streams *define.AttachStreams, newSize *define.TerminalSize) (int, chan error, error)
+	ExecContainer(ctr *Container, sessionID string, options *ExecOptions, streams *define.AttachStreams, newSize *resize.TerminalSize) (int, chan error, error)
 	// ExecContainerHTTP executes a command in a running container and
 	// attaches its standard streams to a provided hijacked HTTP session.
 	// Maintains the same invariants as ExecContainer (returns on session
@@ -84,14 +88,14 @@ type OCIRuntime interface {
 	// The HTTP attach itself maintains the same invariants as HTTPAttach.
 	// newSize resizes the tty to this size before the process is started, must be nil if the exec session has no tty
 	ExecContainerHTTP(ctr *Container, sessionID string, options *ExecOptions, r *http.Request, w http.ResponseWriter,
-		streams *HTTPAttachStreams, cancel <-chan bool, hijackDone chan<- bool, holdConnOpen <-chan bool, newSize *define.TerminalSize) (int, chan error, error)
+		streams *HTTPAttachStreams, cancel <-chan bool, hijackDone chan<- bool, holdConnOpen <-chan bool, newSize *resize.TerminalSize) (int, chan error, error)
 	// ExecContainerDetached executes a command in a running container, but
 	// does not attach to it. Returns the PID of the exec session and an
 	// error (if starting the exec session failed)
 	ExecContainerDetached(ctr *Container, sessionID string, options *ExecOptions, stdin bool) (int, error)
 	// ExecAttachResize resizes the terminal of a running exec session. Only
 	// allowed with sessions that were created with a TTY.
-	ExecAttachResize(ctr *Container, sessionID string, newSize define.TerminalSize) error
+	ExecAttachResize(ctr *Container, sessionID string, newSize resize.TerminalSize) error
 	// ExecStopContainer stops a given exec session in a running container.
 	// SIGTERM with be sent initially, then SIGKILL after the given timeout.
 	// If timeout is 0, SIGKILL will be sent immediately, and SIGTERM will
@@ -145,8 +149,17 @@ type OCIRuntime interface {
 	// This is the path to that file for a given container.
 	ExitFilePath(ctr *Container) (string, error)
 
+	// OOMFilePath is the path to a container's oom file if it was oom killed.
+	// An oom file is only created when the container is oom killed. The existence
+	// of this file means that the container was oom killed.
+	// This is the path to that file for a given container.
+	OOMFilePath(ctr *Container) (string, error)
+
 	// RuntimeInfo returns verbose information about the runtime.
 	RuntimeInfo() (*define.ConmonInfo, *define.OCIRuntimeInfo, error)
+
+	// UpdateContainer updates the given container's cgroup configuration.
+	UpdateContainer(ctr *Container, res *specs.LinuxResources) error
 }
 
 // AttachOptions are options used when attached to a container or an exec
@@ -161,7 +174,7 @@ type AttachOptions struct {
 	DetachKeys *string
 	// InitialSize is the initial size of the terminal. Set before the
 	// attach begins.
-	InitialSize *define.TerminalSize
+	InitialSize *resize.TerminalSize
 	// AttachReady signals when the attach has successfully completed and
 	// streaming has begun.
 	AttachReady chan<- bool
@@ -194,6 +207,9 @@ type ExecOptions struct {
 	// to 0, 1, 2) that will be passed to the executed process. The total FDs
 	// passed will be 3 + PreserveFDs.
 	PreserveFDs uint
+	// PreserveFD is a list of additional file descriptors (in addition
+	// to 0, 1, 2) that will be passed to the executed process.
+	PreserveFD []uint
 	// DetachKeys is a set of keys that, when pressed in sequence, will
 	// detach from the container.
 	// If not provided, the default keys will be used.

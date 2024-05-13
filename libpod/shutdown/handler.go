@@ -1,18 +1,18 @@
 package shutdown
 
 import (
+	"errors"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/pkg/errors"
 	logrusImport "github.com/sirupsen/logrus"
 )
 
 var (
-	ErrHandlerExists error = errors.New("handler with given name already exists")
+	ErrHandlerExists = errors.New("handler with given name already exists")
 )
 
 var (
@@ -27,6 +27,7 @@ var (
 	handlerOrder    []string
 	shutdownInhibit sync.RWMutex
 	logrus          = logrusImport.WithField("PID", os.Getpid())
+	ErrNotStarted   = errors.New("shutdown signal handler has not yet been started")
 )
 
 // Start begins handling SIGTERM and SIGINT and will run the given on-signal
@@ -84,7 +85,7 @@ func Start() error {
 // Stop the shutdown signal handler.
 func Stop() error {
 	if cancelChan == nil {
-		return errors.New("shutdown signal handler has not yet been started")
+		return ErrNotStarted
 	}
 	if stopped {
 		return nil

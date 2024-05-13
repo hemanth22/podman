@@ -3,7 +3,7 @@ package common_test
 import (
 	"testing"
 
-	"github.com/containers/podman/v4/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/common"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 )
@@ -50,7 +50,8 @@ func (c *Car) Color() string {
 }
 
 // This is for reflect testing required.
-// nolint:unused
+//
+//nolint:unused
 func (c Car) internal() int {
 	return 0
 }

@@ -17,7 +17,6 @@ import (
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/archive"
 	digest "github.com/opencontainers/go-digest"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -33,7 +32,7 @@ func cacheLookupReferenceFunc(directory string, compress types.LayerCompression)
 		}
 		ref, err := blobcache.NewBlobCache(ref, directory, compress)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error using blobcache %q", directory)
+			return nil, fmt.Errorf("using blobcache %q: %w", directory, err)
 		}
 		return ref, nil
 	}
@@ -96,6 +95,10 @@ type PushOptions struct {
 	CompressionFormat *compression.Algorithm
 	// CompressionLevel specifies what compression level is used
 	CompressionLevel *int
+	// ForceCompressionFormat ensures that the compression algorithm set in
+	// CompressionFormat is used exclusively, and blobs of other compression
+	// algorithms are not reused.
+	ForceCompressionFormat bool
 }
 
 // Push copies the contents of the image to a new location.
@@ -111,6 +114,7 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 	libimageOptions.OciEncryptLayers = options.OciEncryptLayers
 	libimageOptions.CompressionFormat = options.CompressionFormat
 	libimageOptions.CompressionLevel = options.CompressionLevel
+	libimageOptions.ForceCompressionFormat = options.ForceCompressionFormat
 	libimageOptions.PolicyAllowStorage = true
 
 	if options.Quiet {
@@ -136,7 +140,7 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 
 	manifestDigest, err := manifest.Digest(manifestBytes)
 	if err != nil {
-		return nil, "", errors.Wrapf(err, "error computing digest of manifest of new image %q", transports.ImageName(dest))
+		return nil, "", fmt.Errorf("computing digest of manifest of new image %q: %w", transports.ImageName(dest), err)
 	}
 
 	var ref reference.Canonical

@@ -13,6 +13,7 @@ import (
 
 	docker "github.com/fsouza/go-dockerclient"
 
+	buildkitparser "github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/openshift/imagebuilder/dockerfile/command"
 	"github.com/openshift/imagebuilder/dockerfile/parser"
 )
@@ -29,8 +30,20 @@ type Copy struct {
 	Download bool
 	// If set, the owner:group for the destination.  This value is passed
 	// to the executor for handling.
-	Chown string
-	Chmod string
+	Chown    string
+	Chmod    string
+	Checksum string
+	// Additional files which need to be created by executor for this
+	// instruction.
+	Files []File
+}
+
+// File defines if any additional file needs to be created
+// by the executor instruction so that specified command
+// can execute/copy the created file inside the build container.
+type File struct {
+	Name string // Name of the new file.
+	Data string // Content of the file.
 }
 
 // Run defines a run operation required in the container.
@@ -39,11 +52,19 @@ type Run struct {
 	Args  []string
 	// Mounts are mounts specified through the --mount flag inside the Containerfile
 	Mounts []string
+	// Network specifies the network mode to run the container with
+	Network string
+	// Additional files which need to be created by executor for this
+	// instruction.
+	Files []File
 }
 
 type Executor interface {
 	Preserve(path string) error
+	// EnsureContainerPath should ensure that the directory exists, creating any components required
 	EnsureContainerPath(path string) error
+	// EnsureContainerPathAs should ensure that the directory exists, creating any components required
+	// with the specified owner and mode, if either is specified
 	EnsureContainerPathAs(path, user string, mode *os.FileMode) error
 	Copy(excludes []string, copies ...Copy) error
 	Run(run Run, config docker.Config) error
@@ -73,7 +94,7 @@ func (logExecutor) EnsureContainerPathAs(path, user string, mode *os.FileMode) e
 
 func (logExecutor) Copy(excludes []string, copies ...Copy) error {
 	for _, c := range copies {
-		log.Printf("COPY %v -> %s (from:%s download:%t), chown: %s, chmod %s", c.Src, c.Dest, c.From, c.Download, c.Chown, c.Chmod)
+		log.Printf("COPY %v -> %s (from:%s download:%t), chown: %s, chmod %s, checksum: %s", c.Src, c.Dest, c.From, c.Download, c.Chown, c.Chmod, c.Checksum)
 	}
 	return nil
 }
@@ -177,6 +198,21 @@ func (stages Stages) ByName(name string) (Stage, bool) {
 			return stage, true
 		}
 	}
+	if i, err := strconv.Atoi(name); err == nil {
+		return stages.ByPosition(i)
+	}
+	return Stage{}, false
+}
+
+func (stages Stages) ByPosition(position int) (Stage, bool) {
+	for _, stage := range stages {
+		// stage.Position is expected to be the same as the unnamed
+		// index variable for this loop, but comparing to the Position
+		// field's value is easier to explain
+		if stage.Position == position {
+			return stage, true
+		}
+	}
 	return Stage{}, false
 }
 
@@ -188,6 +224,16 @@ func (stages Stages) ByTarget(target string) (Stages, bool) {
 	for i, stage := range stages {
 		if stage.Name == target {
 			return stages[i : i+1], true
+		}
+	}
+	if position, err := strconv.Atoi(target); err == nil {
+		for i, stage := range stages {
+			// stage.Position is expected to be the same as the unnamed
+			// index variable for this loop, but comparing to the Position
+			// field's value is easier to explain
+			if stage.Position == position {
+				return stages[i : i+1], true
+			}
 		}
 	}
 	return nil, false
@@ -203,6 +249,16 @@ func (stages Stages) ThroughTarget(target string) (Stages, bool) {
 			return stages[0 : i+1], true
 		}
 	}
+	if position, err := strconv.Atoi(target); err == nil {
+		for i, stage := range stages {
+			// stage.Position is expected to be the same as the unnamed
+			// index variable for this loop, but comparing to the Position
+			// field's value is easier to explain
+			if stage.Position == position {
+				return stages[0 : i+1], true
+			}
+		}
+	}
 	return nil, false
 }
 
@@ -215,6 +271,17 @@ type Stage struct {
 
 func NewStages(node *parser.Node, b *Builder) (Stages, error) {
 	var stages Stages
+	var allDeclaredArgs []string
+	for _, root := range SplitBy(node, command.Arg) {
+		argNode := root.Children[0]
+		if argNode.Value == command.Arg {
+			// extract declared variable
+			s := strings.SplitN(argNode.Original, " ", 2)
+			if len(s) == 2 && (strings.ToLower(s[0]) == command.Arg) {
+				allDeclaredArgs = append(allDeclaredArgs, s[1])
+			}
+		}
+	}
 	if err := b.extractHeadingArgsFromNode(node); err != nil {
 		return stages, err
 	}
@@ -226,7 +293,7 @@ func NewStages(node *parser.Node, b *Builder) (Stages, error) {
 		stages = append(stages, Stage{
 			Position: i,
 			Name:     name,
-			Builder:  b.builderForStage(),
+			Builder:  b.builderForStage(allDeclaredArgs),
 			Node:     root,
 		})
 	}
@@ -290,8 +357,8 @@ func extractNameFromNode(node *parser.Node) (string, bool) {
 	return n.Next.Value, true
 }
 
-func (b *Builder) builderForStage() *Builder {
-	stageBuilder := NewBuilder(b.UserArgs)
+func (b *Builder) builderForStage(globalArgsList []string) *Builder {
+	stageBuilder := newBuilderWithGlobalAllowedArgs(b.UserArgs, globalArgsList)
 	for k, v := range b.HeadingArgs {
 		stageBuilder.HeadingArgs[k] = v
 	}
@@ -307,6 +374,12 @@ type Builder struct {
 	UserArgs    map[string]string
 	CmdSet      bool
 	Author      string
+	// Certain instructions like `FROM` will need to use
+	// `ARG` decalred before or not in this stage hence
+	// while processing instruction like `FROM ${SOME_ARG}`
+	// we will make sure to verify if they are declared any
+	// where in containerfile or not.
+	GlobalAllowedArgs []string
 
 	AllowedArgs map[string]bool
 	Volumes     VolumeSet
@@ -323,6 +396,10 @@ type Builder struct {
 }
 
 func NewBuilder(args map[string]string) *Builder {
+	return newBuilderWithGlobalAllowedArgs(args, []string{})
+}
+
+func newBuilderWithGlobalAllowedArgs(args map[string]string, globalallowedargs []string) *Builder {
 	allowed := make(map[string]bool)
 	for k, v := range builtinAllowedBuildArgs {
 		allowed[k] = v
@@ -334,10 +411,11 @@ func NewBuilder(args map[string]string) *Builder {
 		initialArgs[k] = v
 	}
 	return &Builder{
-		Args:        initialArgs,
-		UserArgs:    userArgs,
-		HeadingArgs: make(map[string]string),
-		AllowedArgs: allowed,
+		Args:              initialArgs,
+		UserArgs:          userArgs,
+		HeadingArgs:       make(map[string]string),
+		AllowedArgs:       allowed,
+		GlobalAllowedArgs: globalallowedargs,
 	}
 }
 
@@ -367,7 +445,7 @@ func (b *Builder) Run(step *Step, exec Executor, noRunsRemaining bool) error {
 	if !ok {
 		return exec.UnrecognizedInstruction(step)
 	}
-	if err := fn(b, step.Args, step.Attrs, step.Flags, step.Original); err != nil {
+	if err := fn(b, step.Args, step.Attrs, step.Flags, step.Original, step.Heredocs); err != nil {
 		return err
 	}
 
@@ -547,7 +625,7 @@ func SplitBy(node *parser.Node, value string) []*parser.Node {
 }
 
 // StepFunc is invoked with the result of a resolved step.
-type StepFunc func(*Builder, []string, map[string]bool, []string, string) error
+type StepFunc func(*Builder, []string, map[string]bool, []string, string, []buildkitparser.Heredoc) error
 
 var evaluateTable = map[string]StepFunc{
 	command.Env:         env,

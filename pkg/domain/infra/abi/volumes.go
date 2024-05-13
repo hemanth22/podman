@@ -2,14 +2,15 @@ package abi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/entities/reports"
-	"github.com/containers/podman/v4/pkg/domain/filters"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi/parse"
-	"github.com/pkg/errors"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/domain/filters"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi/parse"
 )
 
 func (ic *ContainerEngine) VolumeCreate(ctx context.Context, opts entities.VolumeCreateOptions) (*entities.IDOrNameResponse, error) {
@@ -32,6 +33,11 @@ func (ic *ContainerEngine) VolumeCreate(ctx context.Context, opts entities.Volum
 		}
 		volumeOptions = append(volumeOptions, parsedOptions...)
 	}
+
+	if opts.IgnoreIfExists {
+		volumeOptions = append(volumeOptions, libpod.WithVolumeIgnoreIfExist())
+	}
+
 	vol, err := ic.Libpod.NewVolume(ctx, volumeOptions...)
 	if err != nil {
 		return nil, err
@@ -55,6 +61,9 @@ func (ic *ContainerEngine) VolumeRm(ctx context.Context, namesOrIds []string, op
 		for _, id := range namesOrIds {
 			vol, err := ic.Libpod.LookupVolume(id)
 			if err != nil {
+				if opts.Ignore && errors.Is(err, define.ErrNoSuchVolume) {
+					continue
+				}
 				reports = append(reports, &entities.VolumeRmReport{
 					Err: err,
 					Id:  id,
@@ -91,11 +100,11 @@ func (ic *ContainerEngine) VolumeInspect(ctx context.Context, namesOrIds []strin
 		for _, v := range namesOrIds {
 			vol, err := ic.Libpod.LookupVolume(v)
 			if err != nil {
-				if errors.Cause(err) == define.ErrNoSuchVolume {
-					errs = append(errs, errors.Errorf("no such volume %s", v))
+				if errors.Is(err, define.ErrNoSuchVolume) {
+					errs = append(errs, fmt.Errorf("no such volume %s", v))
 					continue
 				} else {
-					return nil, nil, errors.Wrapf(err, "error inspecting volume %s", v)
+					return nil, nil, fmt.Errorf("inspecting volume %s: %w", v, err)
 				}
 			}
 			vols = append(vols, vol)
@@ -116,11 +125,15 @@ func (ic *ContainerEngine) VolumeInspect(ctx context.Context, namesOrIds []strin
 }
 
 func (ic *ContainerEngine) VolumePrune(ctx context.Context, options entities.VolumePruneOptions) ([]*reports.PruneReport, error) {
-	filterFuncs, err := filters.GenerateVolumeFilters(options.Filters)
-	if err != nil {
-		return nil, err
+	funcs := []libpod.VolumeFilter{}
+	for filter, filterValues := range options.Filters {
+		filterFunc, err := filters.GenerateVolumeFilters(filter, filterValues, ic.Libpod)
+		if err != nil {
+			return nil, err
+		}
+		funcs = append(funcs, filterFunc)
 	}
-	return ic.pruneVolumesHelper(ctx, filterFuncs)
+	return ic.pruneVolumesHelper(ctx, funcs)
 }
 
 func (ic *ContainerEngine) pruneVolumesHelper(ctx context.Context, filterFuncs []libpod.VolumeFilter) ([]*reports.PruneReport, error) {
@@ -132,10 +145,15 @@ func (ic *ContainerEngine) pruneVolumesHelper(ctx context.Context, filterFuncs [
 }
 
 func (ic *ContainerEngine) VolumeList(ctx context.Context, opts entities.VolumeListOptions) ([]*entities.VolumeListReport, error) {
-	volumeFilters, err := filters.GenerateVolumeFilters(opts.Filter)
-	if err != nil {
-		return nil, err
+	volumeFilters := []libpod.VolumeFilter{}
+	for filter, value := range opts.Filter {
+		filterFunc, err := filters.GenerateVolumeFilters(filter, value, ic.Libpod)
+		if err != nil {
+			return nil, err
+		}
+		volumeFilters = append(volumeFilters, filterFunc)
 	}
+
 	vols, err := ic.Libpod.Volumes(volumeFilters...)
 	if err != nil {
 		return nil, err
@@ -172,7 +190,7 @@ func (ic *ContainerEngine) VolumeMounted(ctx context.Context, nameOrID string) (
 	mountCount, err := vol.MountCount()
 	if err != nil {
 		// FIXME: this error should probably be returned
-		return &entities.BoolReport{Value: false}, nil // nolint: nilerr
+		return &entities.BoolReport{Value: false}, nil //nolint: nilerr
 	}
 	if mountCount > 0 {
 		return &entities.BoolReport{Value: true}, nil
@@ -210,4 +228,9 @@ func (ic *ContainerEngine) VolumeUnmount(ctx context.Context, nameOrIDs []string
 	}
 
 	return reports, nil
+}
+
+func (ic *ContainerEngine) VolumeReload(ctx context.Context) (*entities.VolumeReloadReport, error) {
+	report := ic.Libpod.UpdateVolumePlugins(ctx)
+	return &entities.VolumeReloadReport{VolumeReload: *report}, nil
 }
