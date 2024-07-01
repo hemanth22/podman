@@ -273,14 +273,41 @@ spec:
     - name: testctr
       image: ` + CITEST_IMAGE + `
       command:
-        - sleep
-        - inf
+      - /bin/sh
+      - -c
+      - |
+        trap exit SIGTERM
+        while :; do sleep 0.1; done
       volumeMounts:
       - mountPath: /var
         name: testing
         subPath: testing/onlythis
     volumes:
     - name: testing
+      persistentVolumeClaim:
+        claimName: testvol
+`
+
+var signalTest = `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: testpod
+spec:
+    containers:
+    - name: testctr
+      image: ` + CITEST_IMAGE + `
+      command:
+        - /bin/sh
+        - -c
+        - |
+          trap 'echo TERMINATED > /testvol/termfile; exit' SIGTERM
+          while true; do sleep 0.1; done
+      volumeMounts:
+      - mountPath: /testvol
+        name: testvol
+    volumes:
+    - name: testvol
       persistentVolumeClaim:
         claimName: testvol
 `
@@ -2369,7 +2396,7 @@ var _ = Describe("Podman kube play", func() {
 
 		hc := podmanTest.Podman([]string{"healthcheck", "run", ctrName})
 		hc.WaitWithDefaultTimeout()
-		Expect(hc).Should(ExitWithError(1))
+		Expect(hc).Should(ExitWithError(1, ""))
 
 		exec := podmanTest.Podman([]string{"exec", ctrName, "sh", "-c", "echo 'startup probe success' > /testfile"})
 		exec.WaitWithDefaultTimeout()
@@ -4511,7 +4538,7 @@ invalid kube kind
 		// volume should not be deleted on teardown
 		exists = podmanTest.Podman([]string{"volume", "exists", volName})
 		exists.WaitWithDefaultTimeout()
-		Expect(exists).To(Exit(1))
+		Expect(exists).To(ExitWithError(1, ""))
 	})
 
 	It("after teardown with volume reuse", func() {
@@ -5569,6 +5596,28 @@ spec:
 		Expect(checkVol.OutputToString()).To(Equal("testvol1"))
 	})
 
+	It("with graceful shutdown", func() {
+
+		volumeCreate := podmanTest.Podman([]string{"volume", "create", "testvol"})
+		volumeCreate.WaitWithDefaultTimeout()
+		Expect(volumeCreate).Should(ExitCleanly())
+
+		err = writeYaml(signalTest, kubeYaml)
+		Expect(err).ToNot(HaveOccurred())
+
+		playKube := podmanTest.Podman([]string{"kube", "play", kubeYaml})
+		playKube.WaitWithDefaultTimeout()
+		Expect(playKube).Should(ExitCleanly())
+
+		teardown := podmanTest.Podman([]string{"kube", "down", kubeYaml})
+		teardown.WaitWithDefaultTimeout()
+		Expect(teardown).Should(ExitCleanly())
+
+		session := podmanTest.Podman([]string{"run", "--volume", "testvol:/testvol", CITEST_IMAGE, "sh", "-c", "cat /testvol/termfile"})
+		session.WaitWithDefaultTimeout()
+		Expect(session.OutputToString()).Should(ContainSubstring("TERMINATED"))
+	})
+
 	It("with hostPath subpaths", func() {
 		if !Containerized() {
 			Skip("something is wrong with file permissions in CI or in the yaml creation. cannot ls or cat the fs unless in a container")
@@ -5688,7 +5737,7 @@ spec:
 
 		curlTest := podmanTest.Podman([]string{"run", "--network", "host", NGINX_IMAGE, "curl", "-s", "localhost:19000"})
 		curlTest.WaitWithDefaultTimeout()
-		Expect(curlTest).Should(ExitWithError(7))
+		Expect(curlTest).Should(ExitWithError(7, ""))
 	})
 
 	It("without Ports, publish in command line - curl should succeed", func() {

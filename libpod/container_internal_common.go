@@ -565,8 +565,21 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 		return nil, nil, err
 	}
 
-	g.SetRootPath(c.state.Mountpoint)
+	rootPath, err := c.getRootPathForOCI()
+	if err != nil {
+		return nil, nil, err
+	}
+	g.SetRootPath(rootPath)
 	g.AddAnnotation("org.opencontainers.image.stopSignal", strconv.FormatUint(uint64(c.config.StopSignal), 10))
+
+	if c.config.StopSignal != 0 {
+		g.AddAnnotation("org.systemd.property.KillSignal", strconv.FormatUint(uint64(c.config.StopSignal), 10))
+	}
+
+	if c.config.StopTimeout != 0 {
+		annotation := fmt.Sprintf("uint64 %d", c.config.StopTimeout*1000000) // sec to usec
+		g.AddAnnotation("org.systemd.property.TimeoutStopUSec", annotation)
+	}
 
 	if _, exists := g.Config.Annotations[annotations.ContainerManager]; !exists {
 		g.AddAnnotation(annotations.ContainerManager, annotations.ContainerManagerLibpod)
@@ -1712,6 +1725,15 @@ func (c *Container) restore(ctx context.Context, options ContainerCheckpointOpti
 		}
 	}
 
+	// setup hosts/resolv.conf files
+	// Note this should normally be called after the container is created in the runtime but before it is started.
+	// However restore starts the container right away. This means that if we do the call afterwards there is a
+	// short interval where the file is still empty. Thus I decided to call it before which makes it not working
+	// with PostConfigureNetNS (userns) but as this does not work anyway today so I don't see it as problem.
+	if err := c.completeNetworkSetup(); err != nil {
+		return nil, 0, fmt.Errorf("complete network setup: %w", err)
+	}
+
 	runtimeRestoreDuration, err = c.ociRuntime.CreateContainer(c, &options)
 	if err != nil {
 		return nil, 0, err
@@ -1834,10 +1856,6 @@ func (c *Container) mountIntoRootDirs(mountName string, mountPath string) error 
 
 // Make standard bind mounts to include in the container
 func (c *Container) makeBindMounts() error {
-	if err := idtools.SafeChown(c.state.RunDir, c.RootUID(), c.RootGID()); err != nil {
-		return fmt.Errorf("cannot chown run directory: %w", err)
-	}
-
 	if c.state.BindMounts == nil {
 		c.state.BindMounts = make(map[string]string)
 	}
@@ -1915,15 +1933,6 @@ func (c *Container) makeBindMounts() error {
 				err = c.mountIntoRootDirs(config.DefaultHostsFile, hostsPath)
 				if err != nil {
 					return fmt.Errorf("assigning mounts to container %s: %w", c.ID(), err)
-				}
-			}
-
-			if !hasCurrentUserMapped(c) {
-				if err := makeAccessible(resolvPath, c.RootUID(), c.RootGID()); err != nil {
-					return err
-				}
-				if err := makeAccessible(hostsPath, c.RootUID(), c.RootGID()); err != nil {
-					return err
 				}
 			}
 		} else {
@@ -2299,6 +2308,15 @@ func (c *Container) addHosts() error {
 	var exclude []net.IP
 	if c.pastaResult != nil {
 		exclude = c.pastaResult.IPAddresses
+	} else if c.config.NetMode.IsBridge() {
+		// When running rootless we have to check the rootless netns ip addresses
+		// to not assign a ip that is already used in the rootless netns as it would
+		// not be routed to the host.
+		// https://github.com/containers/podman/issues/22653
+		info, err := c.runtime.network.RootlessNetnsInfo()
+		if err == nil {
+			exclude = info.IPAddresses
+		}
 	}
 
 	return etchosts.New(&etchosts.Params{
@@ -2859,11 +2877,26 @@ func (c *Container) fixVolumePermissions(v *ContainerNamedVolume) error {
 		return err
 	}
 
+	// If the volume is not empty, and it is not the first copy-up event -
+	// we should not do a chown.
+	if vol.state.NeedsChown && !vol.state.CopiedUp {
+		contents, err := os.ReadDir(vol.mountPoint())
+		if err != nil {
+			return fmt.Errorf("reading contents of volume %q: %w", vol.Name(), err)
+		}
+		// Not empty, do nothing and unset NeedsChown.
+		if len(contents) > 0 {
+			vol.state.NeedsChown = false
+			if err := vol.save(); err != nil {
+				return fmt.Errorf("saving volume %q state: %w", vol.Name(), err)
+			}
+			return nil
+		}
+	}
+
 	// Volumes owned by a volume driver are not chowned - we don't want to
 	// mess with a mount not managed by us.
 	if vol.state.NeedsChown && (!vol.UsesVolumeDriver() && vol.config.Driver != "image") {
-		vol.state.NeedsChown = false
-
 		uid := int(c.config.Spec.Process.User.UID)
 		gid := int(c.config.Spec.Process.User.GID)
 
@@ -2882,6 +2915,10 @@ func (c *Container) fixVolumePermissions(v *ContainerNamedVolume) error {
 			gid = newPair.GID
 		}
 
+		if vol.state.CopiedUp {
+			vol.state.NeedsChown = false
+		}
+		vol.state.CopiedUp = false
 		vol.state.UIDChowned = uid
 		vol.state.GIDChowned = gid
 
@@ -2925,6 +2962,16 @@ func (c *Container) fixVolumePermissions(v *ContainerNamedVolume) error {
 
 				if err := idtools.SafeLchown(mountPoint, uid, gid); err != nil {
 					return err
+				}
+
+				// UID/GID 0 are sticky - if we chown to root,
+				// we stop chowning thereafter.
+				if uid == 0 && gid == 0 && vol.state.NeedsChown {
+					vol.state.NeedsChown = false
+
+					if err := vol.save(); err != nil {
+						return fmt.Errorf("saving volume %q state to database: %w", vol.Name(), err)
+					}
 				}
 			}
 			if err := os.Chmod(mountPoint, st.Mode()); err != nil {

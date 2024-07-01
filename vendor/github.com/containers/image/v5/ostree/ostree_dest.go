@@ -164,7 +164,7 @@ func (d *ostreeImageDestination) PutBlobWithOptions(ctx context.Context, stream 
 		return private.UploadedBlob{}, err
 	}
 
-	hash := blobDigest.Hex()
+	hash := blobDigest.Encoded()
 	d.blobs[hash] = &blobToImport{Size: size, Digest: blobDigest, BlobPath: blobPath}
 	return private.UploadedBlob{Digest: blobDigest, Size: size}, nil
 }
@@ -282,8 +282,8 @@ func generateTarSplitMetadata(output *bytes.Buffer, file string) (digest.Digest,
 func (d *ostreeImageDestination) importBlob(selinuxHnd *C.struct_selabel_handle, repo *otbuiltin.Repo, blob *blobToImport) error {
 	// TODO: This can take quite some time, and should ideally be cancellable using a context.Context.
 
-	ostreeBranch := fmt.Sprintf("ociimage/%s", blob.Digest.Hex())
-	destinationPath := filepath.Join(d.tmpDirPath, blob.Digest.Hex(), "root")
+	ostreeBranch := fmt.Sprintf("ociimage/%s", blob.Digest.Encoded())
+	destinationPath := filepath.Join(d.tmpDirPath, blob.Digest.Encoded(), "root")
 	if err := ensureDirectoryExists(destinationPath); err != nil {
 		return err
 	}
@@ -323,7 +323,7 @@ func (d *ostreeImageDestination) importBlob(selinuxHnd *C.struct_selabel_handle,
 }
 
 func (d *ostreeImageDestination) importConfig(repo *otbuiltin.Repo, blob *blobToImport) error {
-	ostreeBranch := fmt.Sprintf("ociimage/%s", blob.Digest.Hex())
+	ostreeBranch := fmt.Sprintf("ociimage/%s", blob.Digest.Encoded())
 	destinationPath := filepath.Dir(blob.BlobPath)
 
 	return d.ostreeCommit(repo, ostreeBranch, destinationPath, []string{fmt.Sprintf("docker.size=%d", blob.Size)})
@@ -347,7 +347,11 @@ func (d *ostreeImageDestination) TryReusingBlobWithOptions(ctx context.Context, 
 		}
 		d.repo = repo
 	}
-	branch := fmt.Sprintf("ociimage/%s", info.Digest.Hex())
+
+	if err := info.Digest.Validate(); err != nil { // digest.Digest.Encoded() panics on failure, so validate explicitly.
+		return false, private.ReusedBlob{}, err
+	}
+	branch := fmt.Sprintf("ociimage/%s", info.Digest.Encoded())
 
 	found, data, err := readMetadata(d.repo, branch, "docker.uncompressed_digest")
 	if err != nil || !found {
@@ -472,13 +476,19 @@ func (d *ostreeImageDestination) Commit(context.Context, types.UnparsedImage) er
 		return nil
 	}
 	for _, layer := range d.schema.LayersDescriptors {
-		hash := layer.Digest.Hex()
+		if err := layer.Digest.Validate(); err != nil { // digest.Digest.Encoded() panics on failure, so validate explicitly.
+			return err
+		}
+		hash := layer.Digest.Encoded()
 		if err = checkLayer(hash); err != nil {
 			return err
 		}
 	}
 	for _, layer := range d.schema.FSLayers {
-		hash := layer.BlobSum.Hex()
+		if err := layer.BlobSum.Validate(); err != nil { // digest.Digest.Encoded() panics on failure, so validate explicitly.
+			return err
+		}
+		hash := layer.BlobSum.Encoded()
 		if err = checkLayer(hash); err != nil {
 			return err
 		}

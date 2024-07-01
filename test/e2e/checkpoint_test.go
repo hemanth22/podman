@@ -370,8 +370,16 @@ var _ = Describe("Podman checkpoint", func() {
 		result = podmanTest.Podman([]string{"container", "restore", cid})
 		result.WaitWithDefaultTimeout()
 
-		// FIXME: CRIU failure message not seen by podman (same as above)
-		Expect(result).Should(ExitWithError(125))
+		// default message when using crun
+		expectStderr := "crun: CRIU restoring failed -52. Please check CRIU logfile"
+		if podmanTest.OCIRuntime == "runc" {
+			expectStderr = "runc: criu failed: type NOTIFY errno 0"
+		}
+		if !IsRemote() {
+			// This part is only seen with podman local, never remote
+			expectStderr = "OCI runtime error: " + expectStderr
+		}
+		Expect(result).Should(ExitWithError(125, expectStderr))
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(0))
 		Expect(podmanTest.GetContainerStatus()).To(ContainSubstring("Exited"))
 
@@ -1102,28 +1110,28 @@ var _ = Describe("Podman checkpoint", func() {
 		"net,uts",
 		"uts,pid",
 	}
-	for _, share := range namespaceCombination {
+	for index, share := range namespaceCombination {
 		testName := fmt.Sprintf(
 			"podman checkpoint and restore container out of and into pod (%s)",
 			share,
 		)
 
 		share := share // copy into local scope, for use inside function
+		index := index
 
 		It(testName, func() {
+			podName := "test_pod"
+
 			if err := criu.CheckForCriu(criu.PodCriuVersion); err != nil {
 				Skip(fmt.Sprintf("check CRIU pod version error: %v", err))
 			}
+
 			if !crutils.CRRuntimeSupportsPodCheckpointRestore(podmanTest.OCIRuntime) {
 				Skip("runtime does not support pod restore: " + podmanTest.OCIRuntime)
 			}
+
 			// Create a pod
-			session := podmanTest.Podman([]string{
-				"pod",
-				"create",
-				"--share",
-				share,
-			})
+			session := podmanTest.Podman([]string{"pod", "create", "--name", podName, "--share", share})
 			session.WaitWithDefaultTimeout()
 			Expect(session).To(ExitCleanly())
 			podID := session.OutputToString()
@@ -1179,12 +1187,7 @@ var _ = Describe("Podman checkpoint", func() {
 
 			wrongShare := share[:strings.LastIndex(share, ",")]
 
-			session = podmanTest.Podman([]string{
-				"pod",
-				"create",
-				"--share",
-				wrongShare,
-			})
+			session = podmanTest.Podman([]string{"pod", "create", "--name", podName, "--share", wrongShare})
 			session.WaitWithDefaultTimeout()
 			Expect(session).To(ExitCleanly())
 			podID = session.OutputToString()
@@ -1210,25 +1213,18 @@ var _ = Describe("Podman checkpoint", func() {
 			result.WaitWithDefaultTimeout()
 			Expect(result).To(ExitCleanly())
 
-			session = podmanTest.Podman([]string{
-				"pod",
-				"create",
-				"--share",
-				share,
-			})
+			session = podmanTest.Podman([]string{"pod", "create", "--name", podName, "--share", share})
 			session.WaitWithDefaultTimeout()
 			Expect(session).To(ExitCleanly())
 			podID = session.OutputToString()
 
-			// Restore container with different port mapping
-			result = podmanTest.Podman([]string{
-				"container",
-				"restore",
-				"--pod",
-				podID,
-				"-i",
-				fileName,
-			})
+			// Restore container into Pod.
+			// Verify that restore works with both Pod name and ID.
+			podArg := podName
+			if index%2 == 1 {
+				podArg = podID
+			}
+			result = podmanTest.Podman([]string{"container", "restore", "--pod", podArg, "-i", fileName})
 			result.WaitWithDefaultTimeout()
 
 			Expect(result).To(ExitCleanly())

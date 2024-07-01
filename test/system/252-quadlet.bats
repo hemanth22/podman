@@ -143,6 +143,39 @@ function remove_secret() {
     run_podman secret rm $secret_name
 }
 
+function wait_for_journal() {
+    local step=1
+    local count=10
+    local expect_str=
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -s|--step)
+                step="$2"
+                shift 2
+                ;;
+            -c|--count)
+                count="$2"
+                shift 2
+                ;;
+            *)
+                expect_str="$1"
+                shift 1
+                ;;
+        esac
+    done
+
+    while [ "$count" -gt 0 ]; do
+        run journalctl "--since=$STARTED_TIME" --unit="$QUADLET_SERVICE_NAME"
+        if [[ "$output" =~ "$expect_str" ]]; then
+            return
+        fi
+        sleep "$step"
+        count=$(( count - 1 ))
+    done
+    die "Timed out waiting for '$expect_str' in journalctl output"
+}
+
 @test "quadlet - basic" {
     # Network=none is to work around a Pasta bug, can be removed once a patched Pasta is available.
     # Ref https://github.com/containers/podman/pull/21563#issuecomment-1965145324
@@ -150,16 +183,13 @@ function remove_secret() {
     cat > $quadlet_file <<EOF
 [Container]
 Image=$IMAGE
-Exec=sh -c "echo STARTED CONTAINER; echo "READY=1" | socat -u STDIN unix-sendto:\$NOTIFY_SOCKET; sleep inf"
+# Note it is important that the trap is before the ready message,
+# otherwise the signal handler may not registered in time before we do systemctl stop.
+Exec=sh -c "echo STARTED CONTAINER; trap 'exit' SIGTERM; echo "READY=1" | socat -u STDIN unix-sendto:\$NOTIFY_SOCKET; while :; do sleep 0.1; done"
 Notify=yes
 LogDriver=passthrough
 Network=none
 EOF
-
-    # FIXME: Temporary until podman fully removes cgroupsv1 support; see #21431
-    if [[ -n "$PODMAN_IGNORE_CGROUPSV1_WARNING" ]]; then
-        skip "Way too complicated to test under cgroupsv1, and not worth the effort"
-    fi
 
     run_quadlet "$quadlet_file"
     service_setup $QUADLET_SERVICE_NAME
@@ -180,7 +210,7 @@ EOF
     run_podman container inspect  --format "{{.State.Status}}" $QUADLET_CONTAINER_NAME
     is "$output" "running" "container should be started by systemd and hence be running"
 
-    service_cleanup $QUADLET_SERVICE_NAME failed
+    service_cleanup $QUADLET_SERVICE_NAME inactive
 }
 
 @test "quadlet conflict names" {
@@ -233,13 +263,15 @@ EOF
     service_cleanup $QUADLET_SERVICE_NAME inactive
 }
 
-@test "quadlet - ContainerName" {
+@test "quadlet - ContainerName and journal output check" {
     local quadlet_file=$PODMAN_TMPDIR/containername_$(random_string).container
+    local token_out="STDOUT$(random_string 10)"
+    local token_err="STDERR$(random_string 10)"
     cat > $quadlet_file <<EOF
 [Container]
 ContainerName=customcontainername
 Image=$IMAGE
-Exec=top"
+Exec=sh -c "echo $token_out; echo $token_err 1>&2; top -d 10"
 EOF
 
     run_quadlet "$quadlet_file"
@@ -248,6 +280,18 @@ EOF
     # Ensure we can access with the custom container name
     run_podman container inspect  --format "{{.State.Status}}" customcontainername
     is "$output" "running" "container should be started by systemd and hence be running"
+
+    wait_for_journal "Started $QUADLET_SERVICE_NAME"
+
+    run journalctl "--since=$STARTED_TIME" --unit="$QUADLET_SERVICE_NAME"
+    assert "$output" =~ "$token_out" "Output can be found with journalctl"
+    assert "$output" =~ "$token_err" "Error can be found with journalctl"
+    assert "$output" =~ "Starting $QUADLET_SERVICE_NAME" "Status information can be found with journalctl"
+
+    # log priority 3 in journalctl is err. This is documented in syslog(3)
+    run journalctl "--since=$STARTED_TIME" --priority=3 --unit="$QUADLET_SERVICE_NAME"
+    assert "$output" =~ "$token_err" "Error can be found with journalctl --priority=3"
+    assert "$output" !~ "$token_out" "Output can not be found with journalctl --priority=3"
 
     service_cleanup $QUADLET_SERVICE_NAME failed
 }
@@ -322,6 +366,7 @@ EOF
     is "$output" "with space"
 
     service_cleanup $QUADLET_SERVICE_NAME inactive
+    run_podman volume rm $volume_name
 }
 
 # A quadlet container depends on a quadlet volume
@@ -448,6 +493,7 @@ EOF
     is "$output" "with space"
 
     service_cleanup $QUADLET_SERVICE_NAME inactive
+    run_podman network rm $network_name
 }
 
 # A quadlet container depends on a quadlet network
@@ -589,6 +635,7 @@ EOF
 
     service_cleanup $QUADLET_SERVICE_NAME inactive
     run_podman rmi $(pause_image)
+    run_podman network rm podman-default-kube-network
 }
 
 @test "quadlet kube - named network dependency" {
@@ -958,6 +1005,7 @@ EOF
    done < <(parse_table "$exit_tests")
 
    run_podman rmi $(pause_image)
+   run_podman network rm podman-default-kube-network
 }
 
 @test "quadlet kube - Working Directory" {
@@ -1018,6 +1066,7 @@ EOF
 
     service_cleanup $QUADLET_SERVICE_NAME inactive
     run_podman rmi $(pause_image)
+    run_podman network rm podman-default-kube-network
 }
 
 @test "quadlet - image files" {
@@ -1249,6 +1298,7 @@ EOF
     service_cleanup $pod_service inactive
     run_podman volume rm $quadlet_kube_volume_name
     run_podman rmi --ignore $(pause_image)
+    run_podman network rm podman-default-kube-network
 }
 
 @test "quadlet - kube down force" {
@@ -1328,6 +1378,7 @@ EOF
     # Volume should not exist
     run_podman 1 volume exists ${quadlet_kube_volume_name}
     run_podman rmi --ignore $(pause_image)
+    run_podman network rm podman-default-kube-network
 }
 
 @test "quadlet - image tag" {
@@ -1415,6 +1466,7 @@ EOF
     service_cleanup $container_service failed
     run_podman image rm --ignore $image_for_test
     run_podman rmi --ignore $(pause_image)
+    run_podman volume rm $volume_name
 }
 
 @test "quadlet - pod simple" {
@@ -1433,8 +1485,11 @@ EOF
     cat > $quadlet_container_file <<EOF
 [Container]
 Image=$IMAGE
-Exec=sh -c "echo STARTED CONTAINER; echo "READY=1" | socat -u STDIN unix-sendto:\$NOTIFY_SOCKET; sleep inf"
+# Note it is important that the trap is before the ready message,
+# otherwise the signal handler may not registered in time before we do systemctl stop.
+Exec=sh -c "echo STARTED CONTAINER; trap 'exit' SIGTERM; echo "READY=1" | socat -u STDIN unix-sendto:\$NOTIFY_SOCKET; while :; do sleep 0.1; done"
 Pod=$quadlet_pod_unit
+Notify=yes
 EOF
 
     # Use the same directory for all quadlet files to make sure later steps access previous ones
@@ -1467,7 +1522,7 @@ EOF
 
     # The service of the container should be active
     run systemctl show --property=ActiveState "$container_service"
-    assert "ActiveState=failed" \
+    assert "ActiveState=inactive" \
            "quadlet - pod base: container service ActiveState"
 
     # Container should not exist
@@ -1541,5 +1596,6 @@ EOF
 
     service_cleanup $QUADLET_SERVICE_NAME inactive
     run_podman rmi $untagged_image:latest $built_image $(pause_image)
+    run_podman network rm podman-default-kube-network
 }
 # vim: filetype=sh

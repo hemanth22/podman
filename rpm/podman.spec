@@ -101,12 +101,6 @@ Requires: containers-common-extra >= 5:0.58.0-1
 %else
 Requires: containers-common-extra
 %endif
-%if %{defined rhel} && !%{defined eln}
-Recommends: gvisor-tap-vsock-gvforwarder
-%else
-Requires: gvisor-tap-vsock-gvforwarder
-%endif
-Recommends: gvisor-tap-vsock
 Provides: %{name}-quadlet
 Obsoletes: %{name}-quadlet <= 5:4.4.0-1
 Provides: %{name}-quadlet = %{epoch}:%{version}-%{release}
@@ -186,6 +180,17 @@ capabilities specified in user quadlets.
 It is a symlink to %{_bindir}/%{name} and execs into the `%{name}sh` container
 when `%{_bindir}/%{name}sh` is set as a login shell or set as os.Args[0].
 
+%package machine
+Summary: Metapackage for setting up %{name} machine
+Requires: %{name} = %{epoch}:%{version}-%{release}
+Requires: gvisor-tap-vsock
+Requires: qemu
+Requires: virtiofsd
+
+%description machine
+This subpackage installs the dependencies for %{name} machine, for more see:
+https://docs.podman.io/en/latest/markdown/podman-machine.1.html
+
 %prep
 %autosetup -Sgit -n %{name}-%{version_no_tilde}
 sed -i 's;@@PODMAN@@\;$(BINDIR);@@PODMAN@@\;%{_bindir};' Makefile
@@ -240,6 +245,10 @@ export BUILDTAGS="$BASEBUILDTAGS exclude_graphdriver_btrfs btrfs_noversion remot
 export BUILDTAGS="$BASEBUILDTAGS $(hack/btrfs_installed_tag.sh) $(hack/btrfs_tag.sh)"
 %gobuild -o bin/quadlet ./cmd/quadlet
 
+# build %%{name}-testing
+export BUILDTAGS="$BASEBUILDTAGS $(hack/btrfs_installed_tag.sh) $(hack/btrfs_tag.sh)"
+%gobuild -o bin/podman-testing ./cmd/podman-testing
+
 # reset LDFLAGS for plugins binaries
 LDFLAGS=''
 
@@ -255,8 +264,9 @@ PODMAN_VERSION=%{version} %{__make} DESTDIR=%{buildroot} PREFIX=%{_prefix} ETCDI
        install.docker \
        install.docker-docs \
        install.remote \
+       install.testing \
 %if %{defined _modulesloaddir}
-        install.modules-load
+       install.modules-load
 %endif
 
 sed -i 's;%{buildroot};;g' %{buildroot}%{_bindir}/docker
@@ -268,8 +278,11 @@ done
 
 rm -f %{buildroot}%{_mandir}/man5/docker*.5
 
-install -d -p %{buildroot}/%{_datadir}/%{name}/test/system
-cp -pav test/system %{buildroot}/%{_datadir}/%{name}/test/
+install -d -p %{buildroot}%{_datadir}/%{name}/test/system
+cp -pav test/system %{buildroot}%{_datadir}/%{name}/test/
+
+# symlink virtiofsd in %%{name} libexecdir for machine subpackage
+ln -s ../virtiofsd %{buildroot}%{_libexecdir}/%{name}
 
 #define license tag if not already defined
 %{!?_licensedir:%global license %doc}
@@ -314,16 +327,16 @@ cp -pav test/system %{buildroot}/%{_datadir}/%{name}/test/
 %{_datadir}/zsh/site-functions/_%{name}-remote
 
 %files tests
+%{_bindir}/%{name}-testing
 %{_datadir}/%{name}/test
 
 %files -n %{name}sh
 %{_bindir}/%{name}sh
 %{_mandir}/man1/%{name}sh.1*
 
+%files machine
+%dir %{_libexecdir}/%{name}
+%{_libexecdir}/%{name}/virtiofsd
+
 %changelog
-%if %{defined autochangelog}
 %autochangelog
-%else
-* Mon May 01 2023 RH Container Bot <rhcontainerbot@fedoraproject.org>
-- Placeholder changelog for envs that are not autochangelog-ready
-%endif

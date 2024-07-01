@@ -17,6 +17,7 @@ function teardown() {
             run_podman rmi $id
         fi
     done <<<"$output"
+    run_podman network rm -f podman-default-kube-network
 
     basic_teardown
 }
@@ -31,8 +32,7 @@ metadata:
 spec:
   containers:
   - command:
-    - sleep
-    - \"100\"
+    - /home/podman/pause
     env:
     - name: PATH
       value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -633,21 +633,33 @@ EOF
 # kube play --wait=true, where we clear up the created containers, pods, and volumes when a kill or sigterm is triggered
 @test "podman kube play --wait with siginterrupt" {
     cname=c$(random_string 15)
-    fname="/tmp/play_kube_wait_$(random_string 6).yaml"
-    run_podman container create --name $cname $IMAGE top
-    run_podman kube generate -f $fname $cname
-
-    # delete the container we generated from
-    run_podman rm -f $cname
+    fname="$PODMAN_TMPDIR/play_kube_wait_$(random_string 6).yaml"
+    echo "
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: test
+  name: test_pod
+spec:
+  restartPolicy: Never
+  containers:
+    - name: server
+      image: $IMAGE
+      command:
+      - top
+" > $fname
 
     # force a timeout to happen so that the kube play command is killed
     # and expect the timeout code 124 to happen so that we can clean up
     local t0=$SECONDS
-    PODMAN_TIMEOUT=15 run_podman 124 kube play --wait $fname
+    PODMAN_TIMEOUT=2 run_podman 124 kube play --wait $fname
     local t1=$SECONDS
     local delta_t=$((t1 - t0))
-    assert $delta_t -le 20 \
-           "podman kube play did not get killed within 10 seconds"
+    assert $delta_t -le 4 \
+           "podman kube play did not get killed within 3 seconds"
+    # Make sure we actually got SIGTERM and podman printed its message.
+    assert "$output" =~ "Cleaning up containers, pods, and volumes" "kube play printed sigterm message"
 
     # there should be no containers running or created
     run_podman ps -aq
@@ -656,7 +668,7 @@ EOF
 }
 
 @test "podman kube play --wait - wait for pod to exit" {
-    fname="/tmp/play_kube_wait_$(random_string 6).yaml"
+    fname="$PODMAN_TMPDIR/play_kube_wait_$(random_string 6).yaml"
     echo "
 apiVersion: v1
 kind: Pod
@@ -799,15 +811,12 @@ EOF
 }
 
 @test "podman kube generate tmpfs on /tmp" {
-      KUBE=$PODMAN_TMPDIR/kube.yaml
-      run_podman create --name test $IMAGE sleep 100
-      run_podman kube generate test -f $KUBE
-      run_podman kube play $KUBE
-      run_podman exec test-pod-test sh -c "mount | grep /tmp"
+      local yaml=$PODMAN_TMPDIR/test.yaml
+      _write_test_yaml command=/home/podman/pause
+      run_podman kube play $yaml
+      run_podman exec test_pod-test sh -c "mount | grep /tmp"
       assert "$output" !~ "noexec" "mounts on /tmp should not be noexec"
-      run_podman kube down $KUBE
-      run_podman pod rm -a -f -t 0
-      run_podman rm -a -f -t 0
+      run_podman kube down $yaml
 }
 
 @test "podman kube play - pull policy" {
@@ -881,8 +890,7 @@ spec:
     done
     assert $output == "2-healthy" "After 3 seconds"
 
-    run_podman kube down $fname
-    run_podman pod rm -a
+    run_podman pod rm -fa -t0
     run_podman rm -a
 }
 
@@ -934,8 +942,7 @@ spec:
     done
     assert $output == "2-unhealthy" "After 3 seconds"
 
-    run_podman kube down $fname
-    run_podman pod rm -a
+    run_podman pod rm -fa -t0
     run_podman rm -a
 }
 

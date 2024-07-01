@@ -18,6 +18,7 @@ import (
 	graphdriver "github.com/containers/storage/drivers"
 	"github.com/containers/storage/pkg/chunked/internal"
 	"github.com/containers/storage/pkg/ioutils"
+	"github.com/docker/go-units"
 	jsoniter "github.com/json-iterator/go"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
@@ -34,6 +35,8 @@ const (
 	// https://pages.cs.wisc.edu/~cao/papers/summary-cache/node8.html
 	bloomFilterScale  = 10 // how much bigger is the bloom filter than the number of entries
 	bloomFilterHashes = 3  // number of hash functions for the bloom filter
+
+	maxTagsLen = 100 * units.MB // max size for tags len
 )
 
 type cacheFile struct {
@@ -635,6 +638,14 @@ func readCacheFileFromMemory(bigDataBuffer []byte) (*cacheFile, error) {
 	if err := binary.Read(bigData, binary.LittleEndian, &fnamesLen); err != nil {
 		return nil, err
 	}
+
+	if tagsLen > maxTagsLen {
+		return nil, fmt.Errorf("tags len %d exceeds the maximum allowed size %d", tagsLen, maxTagsLen)
+	}
+	if digestLen > tagLen {
+		return nil, fmt.Errorf("digest len %d exceeds the tag len %d", digestLen, tagLen)
+	}
+
 	tags := make([]byte, tagsLen)
 	if _, err := bigData.Read(tags); err != nil {
 		return nil, err
@@ -642,6 +653,10 @@ func readCacheFileFromMemory(bigDataBuffer []byte) (*cacheFile, error) {
 
 	// retrieve the unread part of the buffer.
 	remaining := bigDataBuffer[len(bigDataBuffer)-bigData.Len():]
+
+	if vdataLen >= uint64(len(remaining)) {
+		return nil, fmt.Errorf("vdata len %d exceeds the remaining buffer size %d", vdataLen, len(remaining))
+	}
 
 	vdata := remaining[:vdataLen]
 	fnames := remaining[vdataLen:]
@@ -823,81 +838,90 @@ func unmarshalToc(manifest []byte) (*internal.TOC, error) {
 	iter := jsoniter.ParseBytes(jsoniter.ConfigFastest, manifest)
 
 	for field := iter.ReadObject(); field != ""; field = iter.ReadObject() {
-		if strings.ToLower(field) == "version" {
+		switch strings.ToLower(field) {
+		case "version":
 			toc.Version = iter.ReadInt()
-			continue
-		}
-		if strings.ToLower(field) != "entries" {
-			iter.Skip()
-			continue
-		}
-		for iter.ReadArray() {
-			var m internal.FileMetadata
-			for field := iter.ReadObject(); field != ""; field = iter.ReadObject() {
-				switch strings.ToLower(field) {
-				case "type":
-					m.Type = iter.ReadString()
-				case "name":
-					m.Name = iter.ReadString()
-				case "linkname":
-					m.Linkname = iter.ReadString()
-				case "mode":
-					m.Mode = iter.ReadInt64()
-				case "size":
-					m.Size = iter.ReadInt64()
-				case "uid":
-					m.UID = iter.ReadInt()
-				case "gid":
-					m.GID = iter.ReadInt()
-				case "modtime":
-					time, err := time.Parse(time.RFC3339, iter.ReadString())
-					if err != nil {
-						return nil, err
+
+		case "entries":
+			for iter.ReadArray() {
+				var m internal.FileMetadata
+				for field := iter.ReadObject(); field != ""; field = iter.ReadObject() {
+					switch strings.ToLower(field) {
+					case "type":
+						m.Type = iter.ReadString()
+					case "name":
+						m.Name = iter.ReadString()
+					case "linkname":
+						m.Linkname = iter.ReadString()
+					case "mode":
+						m.Mode = iter.ReadInt64()
+					case "size":
+						m.Size = iter.ReadInt64()
+					case "uid":
+						m.UID = iter.ReadInt()
+					case "gid":
+						m.GID = iter.ReadInt()
+					case "modtime":
+						time, err := time.Parse(time.RFC3339, iter.ReadString())
+						if err != nil {
+							return nil, err
+						}
+						m.ModTime = &time
+					case "accesstime":
+						time, err := time.Parse(time.RFC3339, iter.ReadString())
+						if err != nil {
+							return nil, err
+						}
+						m.AccessTime = &time
+					case "changetime":
+						time, err := time.Parse(time.RFC3339, iter.ReadString())
+						if err != nil {
+							return nil, err
+						}
+						m.ChangeTime = &time
+					case "devmajor":
+						m.Devmajor = iter.ReadInt64()
+					case "devminor":
+						m.Devminor = iter.ReadInt64()
+					case "digest":
+						m.Digest = iter.ReadString()
+					case "offset":
+						m.Offset = iter.ReadInt64()
+					case "endoffset":
+						m.EndOffset = iter.ReadInt64()
+					case "chunksize":
+						m.ChunkSize = iter.ReadInt64()
+					case "chunkoffset":
+						m.ChunkOffset = iter.ReadInt64()
+					case "chunkdigest":
+						m.ChunkDigest = iter.ReadString()
+					case "chunktype":
+						m.ChunkType = iter.ReadString()
+					case "xattrs":
+						m.Xattrs = make(map[string]string)
+						for key := iter.ReadObject(); key != ""; key = iter.ReadObject() {
+							m.Xattrs[key] = iter.ReadString()
+						}
+					default:
+						iter.Skip()
 					}
-					m.ModTime = &time
-				case "accesstime":
-					time, err := time.Parse(time.RFC3339, iter.ReadString())
-					if err != nil {
-						return nil, err
-					}
-					m.AccessTime = &time
-				case "changetime":
-					time, err := time.Parse(time.RFC3339, iter.ReadString())
-					if err != nil {
-						return nil, err
-					}
-					m.ChangeTime = &time
-				case "devmajor":
-					m.Devmajor = iter.ReadInt64()
-				case "devminor":
-					m.Devminor = iter.ReadInt64()
-				case "digest":
-					m.Digest = iter.ReadString()
-				case "offset":
-					m.Offset = iter.ReadInt64()
-				case "endoffset":
-					m.EndOffset = iter.ReadInt64()
-				case "chunksize":
-					m.ChunkSize = iter.ReadInt64()
-				case "chunkoffset":
-					m.ChunkOffset = iter.ReadInt64()
-				case "chunkdigest":
-					m.ChunkDigest = iter.ReadString()
-				case "chunktype":
-					m.ChunkType = iter.ReadString()
-				case "xattrs":
-					m.Xattrs = make(map[string]string)
-					for key := iter.ReadObject(); key != ""; key = iter.ReadObject() {
-						m.Xattrs[key] = iter.ReadString()
-					}
-				default:
-					iter.Skip()
 				}
+				if m.Type == TypeReg && m.Size == 0 && m.Digest == "" {
+					m.Digest = digestSha256Empty
+				}
+				toc.Entries = append(toc.Entries, m)
 			}
-			if m.Type == TypeReg && m.Size == 0 && m.Digest == "" {
-				m.Digest = digestSha256Empty
+
+		case "tarsplitdigest": // strings.ToLower("tarSplitDigest")
+			s := iter.ReadString()
+			d, err := digest.Parse(s)
+			if err != nil {
+				return nil, fmt.Errorf("invalid tarSplitDigest %q: %w", s, err)
 			}
-			toc.Entries = append(toc.Entries, m)
+			toc.TarSplitDigest = d
+
+		default:
+			iter.Skip()
 		}
 	}
 

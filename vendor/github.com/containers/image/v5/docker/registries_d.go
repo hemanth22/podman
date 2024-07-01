@@ -140,7 +140,7 @@ func loadAndMergeConfig(dirPath string) (*registryConfiguration, error) {
 
 		if config.DefaultDocker != nil {
 			if mergedConfig.DefaultDocker != nil {
-				return nil, fmt.Errorf(`Error parsing signature storage configuration: "default-docker" defined both in "%s" and "%s"`,
+				return nil, fmt.Errorf(`Error parsing signature storage configuration: "default-docker" defined both in %q and %q`,
 					dockerDefaultMergedFrom, configPath)
 			}
 			mergedConfig.DefaultDocker = config.DefaultDocker
@@ -149,7 +149,7 @@ func loadAndMergeConfig(dirPath string) (*registryConfiguration, error) {
 
 		for nsName, nsConfig := range config.Docker { // includes config.Docker == nil
 			if _, ok := mergedConfig.Docker[nsName]; ok {
-				return nil, fmt.Errorf(`Error parsing signature storage configuration: "docker" namespace "%s" defined both in "%s" and "%s"`,
+				return nil, fmt.Errorf(`Error parsing signature storage configuration: "docker" namespace %q defined both in %q and %q`,
 					nsName, nsMergedFrom[nsName], configPath)
 			}
 			mergedConfig.Docker[nsName] = nsConfig
@@ -287,8 +287,11 @@ func (ns registryNamespace) signatureTopLevel(write bool) string {
 // lookasideStorageURL returns an URL usable for accessing signature index in base with known manifestDigest.
 // base is not nil from the caller
 // NOTE: Keep this in sync with docs/signature-protocols.md!
-func lookasideStorageURL(base lookasideStorageBase, manifestDigest digest.Digest, index int) *url.URL {
+func lookasideStorageURL(base lookasideStorageBase, manifestDigest digest.Digest, index int) (*url.URL, error) {
+	if err := manifestDigest.Validate(); err != nil { // digest.Digest.Encoded() panics on failure, and could possibly result in a path with ../, so validate explicitly.
+		return nil, err
+	}
 	sigURL := *base
-	sigURL.Path = fmt.Sprintf("%s@%s=%s/signature-%d", sigURL.Path, manifestDigest.Algorithm(), manifestDigest.Hex(), index+1)
-	return &sigURL
+	sigURL.Path = fmt.Sprintf("%s@%s=%s/signature-%d", sigURL.Path, manifestDigest.Algorithm(), manifestDigest.Encoded(), index+1)
+	return &sigURL, nil
 }

@@ -17,7 +17,7 @@ Valid _mode_ values are:
 
     For example, to set a static ipv4 address and a static mac address, use `--network bridge:ip=10.88.0.10,mac=44:33:22:11:00:99`.
 
-- _\<network name or ID\>_**[:OPTIONS,...]**: Connect to a user-defined network; this is the network name or ID from a network created by **[podman network create](podman-network-create.1.md)**. Using the network name implies the bridge network mode. It is possible to specify the same options described under the bridge mode above. Use the **--network** option multiple times to specify additional networks. \
+- _\<network name or ID\>_**[:OPTIONS,...]**: Connect to a user-defined network; this is the network name or ID from a network created by **[podman network create](podman-network-create.1.md)**. It is possible to specify the same options described under the bridge mode above. Use the **--network** option multiple times to specify additional networks. \
   For backwards compatibility it is also possible to specify comma-separated networks on the first **--network** argument, however this prevents you from using the options described under the bridge section above.
 
 - **none**: Create a network namespace for the container but do not configure network interfaces for it, thus the container has no network connectivity.
@@ -30,7 +30,7 @@ Valid _mode_ values are:
 
 - **private**: Create a new namespace for the container. This uses the **bridge** mode for rootful containers and **slirp4netns** for rootless ones.
 
-- **slirp4netns[:OPTIONS,...]**: use **slirp4netns**(1) to create a user network stack. This is the default for rootless containers. It is possible to specify these additional options, they can also be set with `network_cmd_options` in containers.conf:
+- **slirp4netns[:OPTIONS,...]**: use **slirp4netns**(1) to create a user network stack. It is possible to specify these additional options, they can also be set with `network_cmd_options` in containers.conf:
 
   - **allow_host_loopback=true|false**: Allow slirp4netns to reach the host loopback IP (default is 10.0.2.2 or the second IP from slirp4netns cidr subnet when changed, see the cidr option below). The default is false.
   - **mtu=**_MTU_: Specify the MTU to use for this network. (Default is `65520`).
@@ -46,7 +46,7 @@ Valid _mode_ values are:
 
 - **pasta[:OPTIONS,...]**: use **pasta**(1) to create a user-mode networking
     stack. \
-    This is only supported in rootless mode. \
+    This is the default for rootless containers and only supported in rootless mode. \
     By default, IPv4 and IPv6 addresses and routes, as well as the pod interface
     name, are copied from the host. If port forwarding isn't configured, ports
     are forwarded dynamically as services are bound on either side (init

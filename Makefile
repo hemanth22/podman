@@ -62,7 +62,7 @@ BUILDTAGS += ${EXTRA_BUILDTAGS}
 # N/B: This value is managed by Renovate, manual changes are
 # possible, as long as they don't disturb the formatting
 # (i.e. DO NOT ADD A 'v' prefix!)
-GOLANGCI_LINT_VERSION := 1.58.1
+GOLANGCI_LINT_VERSION := 1.59.1
 PYTHON ?= $(shell command -v python3 python|head -n1)
 PKG_MANAGER ?= $(shell command -v dnf yum|head -n1)
 # ~/.local/bin is not in PATH on all systems
@@ -238,7 +238,7 @@ binaries: podman podman-remote ## Build podman and podman-remote binaries
 else ifneq (, $(findstring $(GOOS),darwin windows))
 binaries: podman-remote ## Build podman-remote (client) only binaries
 else
-binaries: podman podman-remote podmansh rootlessport quadlet ## Build podman, podman-remote and rootlessport binaries quadlet
+binaries: podman podman-remote podman-testing podmansh rootlessport quadlet ## Build podman, podman-remote and rootlessport binaries quadlet
 endif
 
 # Extract text following double-# for targets, as their description for
@@ -276,7 +276,6 @@ help: ## (Default) Print listing of key targets with their descriptions
 
 .PHONY: lint
 lint: golangci-lint
-	@echo "Linting vs commit '$(call err_if_empty,EPOCH_TEST_COMMIT)'"
 ifeq ($(PRE_COMMIT),)
 	@echo "FATAL: pre-commit was not found, make .install.pre-commit to installing it." >&2
 	@exit 2
@@ -312,9 +311,16 @@ test/version/version: version/version.go
 codespell:
 	codespell -S bin,vendor,.git,go.sum,.cirrus.yml,"*.fish,RELEASE_NOTES.md,*.xz,*.gz,*.ps1,*.tar,swagger.yaml,*.tgz,bin2img,*ico,*.png,*.1,*.5,copyimg,*.orig,apidoc.go" -L secon,passt,bu,hastable,te,clos,ans,pullrequest,uint,iff,od,seeked,splitted,marge,erro,hist,ether,specif -w
 
-.PHONY: validate
-validate: lint .gitvalidation validate.completions man-page-check swagger-check tests-expect-exit pr-removes-fixed-skips
+# Code validation target that **DOES NOT** require building podman binaries
+.PHONY: validate-source
+validate-source: lint .gitvalidation swagger-check tests-expect-exit pr-removes-fixed-skips
 
+# Code validation target that **DOES** require building podman binaries
+.PHONY: validate-binaries
+validate-binaries: man-page-check validate.completions
+
+.PHONY: validate
+validate: validate-source validate-binaries
 
 # The image used below is generated manually from contrib/validatepr/Containerfile in this podman repo.  The builds are
 # not automated right now.  The hope is that eventually the quay.io/libpod/fedora_podman is multiarch and can replace this
@@ -324,6 +330,7 @@ validatepr:
 	$(PODMANCMD) run --rm \
 		-v $(CURDIR):/go/src/github.com/containers/podman \
 		--security-opt label=disable \
+		-it \
 		-w /go/src/github.com/containers/podman \
 		quay.io/libpod/validatepr:latest  \
 		make .validatepr
@@ -390,9 +397,9 @@ $(SRCBINDIR)/podman$(BINSFX): $(SOURCES) go.mod go.sum | $(SRCBINDIR)
 		-o $@ ./cmd/podman
 
 $(SRCBINDIR)/podman-remote-static-linux_%: GOARCH = $(patsubst $(SRCBINDIR)/podman-remote-static-linux_%,%,$@)
+$(SRCBINDIR)/podman-remote-static-linux_%: GOOS = linux
 $(SRCBINDIR)/podman-remote-static $(SRCBINDIR)/podman-remote-static-linux_amd64 $(SRCBINDIR)/podman-remote-static-linux_arm64: $(SRCBINDIR) $(SOURCES) go.mod go.sum
 	CGO_ENABLED=0 \
-	GOOS=linux \
 	$(GO) build \
 		$(BUILDFLAGS) \
 		$(GO_LDFLAGS) '$(LDFLAGS_PODMAN_STATIC)' \
@@ -455,6 +462,16 @@ rootlessport: bin/rootlessport
 # Run: `man 1 podmansh` for details.
 podmansh: bin/podman
 	if [ ! -f bin/podmansh ]; then ln -s podman bin/podmansh; fi
+
+$(SRCBINDIR)/podman-testing: $(SOURCES) go.mod go.sum
+	$(GOCMD) build \
+		$(BUILDFLAGS) \
+		$(GO_LDFLAGS) '$(LDFLAGS_PODMAN)' \
+		-tags "${BUILDTAGS}" \
+		-o $@ ./cmd/podman-testing
+
+.PHONY: podman-testing
+podman-testing: bin/podman-testing
 
 ###
 ### Secondary binary-build targets
@@ -591,7 +608,7 @@ docker-docs: docs
 
 .PHONY: validate.completions
 validate.completions: SHELL:=/usr/bin/env bash # Set shell to bash for this target
-validate.completions:
+validate.completions: completions
 	# Check if the files can be loaded by the shell
 	. completions/bash/podman
 	if [ -x /bin/zsh ]; then /bin/zsh completions/zsh/_podman; fi
@@ -664,7 +681,7 @@ localmachine:
 localsystem:
 	# Wipe existing config, database, and cache: start with clean slate.
 	$(RM) -rf ${HOME}/.local/share/containers ${HOME}/.config/containers
-	if timeout -v 1 true; then PODMAN=$(CURDIR)/bin/podman QUADLET=$(CURDIR)/bin/quadlet bats test/system/; else echo "Skipping $@: 'timeout -v' unavailable'"; fi
+	if timeout -v 1 true; then PODMAN=$(CURDIR)/bin/podman QUADLET=$(CURDIR)/bin/quadlet bats -T test/system/; else echo "Skipping $@: 'timeout -v' unavailable'"; fi
 
 .PHONY: remotesystem
 remotesystem:
@@ -689,7 +706,7 @@ remotesystem:
 			echo "Error: ./bin/podman system service did not come up on $$SOCK_FILE" >&2;\
 			exit 1;\
 		fi;\
-		env PODMAN="$(CURDIR)/bin/podman-remote --url $$PODMAN_SOCKET" bats test/system/ ;\
+		env PODMAN="$(CURDIR)/bin/podman-remote --url $$PODMAN_SOCKET" bats -T test/system/ ;\
 		rc=$$?;\
 		kill %1;\
 		rm -f $$SOCK_FILE;\
@@ -876,6 +893,11 @@ ifneq ($(shell uname -s),FreeBSD)
 	install ${SELINUXOPT} -m 644 contrib/tmpfile/podman.conf $(DESTDIR)${TMPFILESDIR}/podman.conf
 endif
 
+.PHONY: install.testing
+install.testing:
+	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(BINDIR)
+	install ${SELINUXOPT} -m 755 bin/podman-testing $(DESTDIR)$(BINDIR)/podman-testing
+
 .PHONY: install.modules-load
 install.modules-load: # This should only be used by distros which might use iptables-legacy, this is not needed on RHEL
 	install ${SELINUXOPT} -m 755 -d $(DESTDIR)${MODULESLOADDIR}
@@ -948,6 +970,7 @@ install.systemd: $(PODMAN_UNIT_FILES)
 	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman.service $(DESTDIR)${USERSYSTEMDDIR}/podman.service
 	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-restart.service $(DESTDIR)${USERSYSTEMDDIR}/podman-restart.service
 	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-kube@.service $(DESTDIR)${USERSYSTEMDDIR}/podman-kube@.service
+	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-clean-transient.service $(DESTDIR)${USERSYSTEMDDIR}/podman-clean-transient.service
 	# System services
 	install ${SELINUXOPT} -m 644 contrib/systemd/auto-update/podman-auto-update.service $(DESTDIR)${SYSTEMDDIR}/podman-auto-update.service
 	install ${SELINUXOPT} -m 644 contrib/systemd/auto-update/podman-auto-update.timer $(DESTDIR)${SYSTEMDDIR}/podman-auto-update.timer

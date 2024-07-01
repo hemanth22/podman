@@ -75,7 +75,7 @@ func DefineBuildFlags(cmd *cobra.Command, buildOpts *BuildFlagsWrapper, isFarmBu
 	if err := flag.Value.Set("missing"); err != nil {
 		logrus.Errorf("Unable to set --pull to 'missing': %v", err)
 	}
-	flag.Usage = `Pull image policy ("always/true"|"missing"|"never/false"|"newer")`
+	flag.Usage = `Pull image policy ("always"|"missing"|"never"|"newer")`
 	flags.AddFlagSet(&budFlags)
 
 	// Add the completion functions
@@ -119,11 +119,14 @@ func DefineBuildFlags(cmd *cobra.Command, buildOpts *BuildFlagsWrapper, isFarmBu
 		_ = flags.MarkHidden("disable-content-trust")
 		_ = flags.MarkHidden("sign-by")
 		_ = flags.MarkHidden("signature-policy")
-		_ = flags.MarkHidden("tls-verify")
 		_ = flags.MarkHidden("compress")
 		_ = flags.MarkHidden("output")
 		_ = flags.MarkHidden("logsplit")
 		_ = flags.MarkHidden("cw")
+		// Support for farm build in podman-remote
+		if !isFarmBuild {
+			_ = flags.MarkHidden("tls-verify")
+		}
 	}
 	if isFarmBuild {
 		for _, f := range FarmBuildHiddenFlags {
@@ -133,9 +136,8 @@ func DefineBuildFlags(cmd *cobra.Command, buildOpts *BuildFlagsWrapper, isFarmBu
 }
 
 func ParseBuildOpts(cmd *cobra.Command, args []string, buildOpts *BuildFlagsWrapper) (*entities.BuildOptions, error) {
-	if (cmd.Flags().Changed("squash") && cmd.Flags().Changed("layers")) ||
-		(cmd.Flags().Changed("squash-all") && cmd.Flags().Changed("squash")) {
-		return nil, errors.New("cannot specify --squash with --layers and --squash-all with --squash")
+	if cmd.Flags().Changed("squash-all") && cmd.Flags().Changed("squash") {
+		return nil, errors.New("cannot specify --squash-all with --squash")
 	}
 
 	if cmd.Flag("output").Changed && registry.IsRemote() {

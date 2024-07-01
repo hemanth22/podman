@@ -413,7 +413,7 @@ var _ = Describe("Podman pull", func() {
 		// Note that reference is not preserved in dir.
 		session = podmanTest.Podman([]string{"image", "exists", "cirros"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(1))
+		Expect(session).Should(ExitWithError(1, ""))
 	})
 
 	It("podman pull from local OCI directory", func() {
@@ -542,7 +542,7 @@ var _ = Describe("Podman pull", func() {
 	It("podman pull --platform", func() {
 		session := podmanTest.Podman([]string{"pull", "-q", "--platform=linux/bogus", ALPINE})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitWithError(125, "no image found in manifest list for architecture bogus"))
+		Expect(session).Should(ExitWithError(125, `no image found in manifest list for architecture "bogus"`))
 
 		session = podmanTest.Podman([]string{"pull", "-q", "--platform=linux/arm64", "--os", "windows", ALPINE})
 		session.WaitWithDefaultTimeout()
@@ -565,7 +565,7 @@ var _ = Describe("Podman pull", func() {
 	It("podman pull --arch", func() {
 		session := podmanTest.Podman([]string{"pull", "-q", "--arch=bogus", ALPINE})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitWithError(125, "no image found in manifest list for architecture bogus"))
+		Expect(session).Should(ExitWithError(125, `no image found in manifest list for architecture "bogus"`))
 
 		session = podmanTest.Podman([]string{"pull", "-q", "--arch=arm64", "--os", "windows", ALPINE})
 		session.WaitWithDefaultTimeout()

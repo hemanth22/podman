@@ -313,8 +313,6 @@ the help of emulation provided by packages like `qemu-user-static`.
 
 @@option pull.image
 
-Pull image policy. The default is **missing**.
-
 @@option quiet
 
 @@option retry
@@ -604,7 +602,7 @@ $ podman build https://10.10.10.1/podman/Containerfile
 #### Building an image using a Git repository
 
   Podman clones the specified GitHub repository to a temporary location and
-use it as the context. The Containerfile at the root of the repository is used
+uses it as the context. The Containerfile at the root of the repository is used
 and it only works if the GitHub repository is a dedicated repository.
 
 Build image from specified git repository downloaded into temporary location used as the build context:
@@ -617,7 +615,7 @@ $ podman run hello
 
 #### Building an image using a URL to an archive
 
-  Podman fetches the archive file, decompress it, and use its contents as the
+  Podman fetches the archive file, decompresses it, and uses its contents as the
 build context. The Containerfile at the root of the archive and the rest of the
 archive are used as the context of the build. Passing the
 `-f PATH/Containerfile` option as well tells the system to look for that file
